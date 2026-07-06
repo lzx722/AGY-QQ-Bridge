@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 agy_qq_bridge_win.py — AGY Windows 常驻进程直连 C2C 桥接 QQ
-架构: QQ官方WS网关 ↔ Python asyncio ↔ Windows subprocess (pipe stdin) ↔ AGY
+架构: QQ官方WS网关 ↔ Python asyncio ↔ Windows ConPTY (pywinpty) ↔ AGY
 """
 import asyncio
 import json
@@ -12,11 +12,9 @@ import time
 import uuid
 import logging
 import glob
-import subprocess
-import aiohttp
 from typing import Optional, Dict, Any
 from pathlib import Path
-from winpty import PTY
+from winpty import PTY  # Windows 运行环境依赖：pip install pywinpty
 
 # ================= 环境与配置加载 =================
 def load_env(env_path: str = ".env"):
@@ -56,9 +54,11 @@ RECONNECT_BACKOFF = [2, 5, 10, 30, 60]
 MAX_RECONNECT_ATTEMPTS = 100
 HEARTBEAT_INTERVAL = 15.0
 
-# 路径配置
-BRAIN_DIR = Path(os.environ.get("BRAIN_DIR", str(Path.home() / ".gemini/antigravity-cli/brain")))
-LOG_DIR = Path(os.environ.get("LOG_DIR", str(Path.home() / ".agy-qq-bridge")))
+# 路径与启动配置
+USER_PROFILE = os.environ.get("USERPROFILE", str(Path.home()))
+BRAIN_DIR = Path(os.environ.get("BRAIN_DIR", str(Path(USER_PROFILE) / ".gemini/antigravity-cli/brain")))
+LOG_DIR = Path(os.environ.get("LOG_DIR", str(Path(USER_PROFILE) / ".agy-qq-bridge")))
+AGY_CMD = os.environ.get("AGY_START_CMD", "agy.cmd --dangerously-skip-permissions")
 # ==========================================
 
 os.makedirs(LOG_DIR, exist_ok=True)
@@ -90,7 +90,7 @@ _current_log_path = None
 _last_sent_timestamp = ""  # 记录最后发送给 QQ 的消息时间戳
 _last_heartbeat_ack_time = 0.0  # 记录最后一次收到心跳确认的时间
 
-# ================= Process Manager for Windows =================
+# ================= Process Manager (ConPTY) =================
 class AgyProcessManager:
     def __init__(self):
         self.pty = None
@@ -98,50 +98,48 @@ class AgyProcessManager:
         self.loop = None
 
     def start(self, fresh=False):
-        """启动或重置常驻的 AGY 虚拟终端进程"""
+        """在后台虚拟终端中拉起并常驻运行 AGY CLI"""
         self.loop = asyncio.get_running_loop()
-        # 如果是重置，先杀掉旧的 PTY
+        
+        # 如果已有运行的终端，先杀掉重置
         if self.pty:
             self.terminate()
             
-        logger.info("[AGY Run] 正在 Windows ConPTY 中拉起常驻 AI 进程...")
+        logger.info("[AGY Run] 正在 Windows ConPTY 中启动常驻 AI 进程...")
         try:
-            # 1. 开启一个后台虚拟终端
+            # 开启一个 80列x24行的 Windows 虚拟控制台
             self.pty = PTY(80, 24)
+            # 在 PTY 内部拉起命令提示符
             self.pty.spawn("cmd.exe")
             
-            # 2. 在虚拟终端中执行常驻命令（使用绝对路径以防 PATH 查找失败，并跳过授权）
-            # 注意：在 Windows 终端中需要使用 \r\n 进行回车
-            start_cmd = "C:\\Users\\Administrator\\AppData\\Local\\agy\\bin\\agy.exe -c --dangerously-skip-permissions\r\n"
+            # 执行命令逻辑（默认续接，若 fresh=True 则重置会话不加 -c）
+            cmd = f"{AGY_CMD} -c\r\n"
             if fresh:
-                # 如果是新会话，不带 -c 参数
-                start_cmd = "C:\\Users\\Administrator\\AppData\\Local\\agy\\bin\\agy.exe --dangerously-skip-permissions\r\n"
+                cmd = f"{AGY_CMD}\r\n"
                 
-            self.pty.write(start_cmd)
+            self.pty.write(cmd)
             
-            # 3. 启动后台读取任务，防止虚拟终端缓冲区满导致进程挂起
+            # 启动后台异步读取，清空 PTY 缓冲区以防进程挂起
             asyncio.create_task(self._pty_stdout_drainer())
-            logger.info("[AGY Run] AI 进程已成功在虚拟终端中常驻保活。")
+            logger.info("[AGY Run] AI 进程拉起成功，已在后台保持常驻。")
         except Exception as e:
-            logger.error(f"[AGY Run] 启动 AI 常驻进程失败: {e}")
+            logger.error(f"[AGY Run] ConPTY 启动失败: {e}")
 
     async def _pty_stdout_drainer(self):
-        """持续清空标准输出缓冲区，防止 PTY 阻塞"""
+        """持续清空 PTY 输出缓冲区"""
         while self.pty:
             try:
-                # winpty.read 是阻塞的，在 executor 中执行避免卡死 asyncio 事件循环
+                # pty.read 在 Windows 上为阻塞读取，需在 executor 中运行防止卡死 asyncio 循环
                 data = await self.loop.run_in_executor(None, self.pty.read, 1024)
                 if not data:
                     break
-                # 将 AI 控制台输出写回本地 stdout 便于后台日志记录
                 sys.stdout.write(data)
                 sys.stdout.flush()
             except Exception:
                 break
-            await asyncio.sleep(0.01)
 
     def terminate(self):
-        """安全终止常驻终端"""
+        """强行关闭当前常驻终端"""
         logger.info("[AGY Run] 正在关闭常驻 AI 进程...")
         if self.pty:
             try:
@@ -151,28 +149,35 @@ class AgyProcessManager:
             self.pty = None
 
     async def send_message(self, msg: str):
-        """
-        向一直保活的 AI 进程发送新指令。
-        直接模拟物理按键输入，绝对不重新创建新进程！
-        """
+        """模拟物理键盘输入将消息送给 AI 进程"""
         if not self.pty:
-            logger.error("[AGY Run] 错误：AI 进程未启动，正在尝试重新拉起...")
+            logger.warning("[AGY Run] AI 进程未启动，正在重新拉起...")
             self.start(fresh=False)
-            await asyncio.sleep(1)
+            await asyncio.sleep(1.0)
             
         async with self.write_lock:
             try:
-                logger.info(f"[Bridge -> AGY] 物理模拟键盘输入指令: {msg}")
-                # 1. 模拟发送 Escape 物理按键 (\x1b)，退出可能卡住的交互状态
+                logger.info(f"[Bridge -> AGY] 写入消息: {msg}")
+                # 发送 Escape 强退可能卡在 TUI 或 PAGER 的状态 (Windows下对应 \x1b)
                 self.pty.write("\x1b")
-                await asyncio.sleep(0.2)
-                
-                # 2. 模拟物理键入消息内容并回车 (\r\n)
+                await asyncio.sleep(0.3)
+                # 写入消息并敲回车 \r\n
                 self.pty.write(f"{msg}\r\n")
             except Exception as e:
                 logger.error(f"[AGY Run] 写入虚拟终端失败: {e}")
 
-# Global process manager
+    async def send_ctrl_c(self):
+        """向常驻进程发送 Ctrl+C 中断信号"""
+        if self.pty:
+            async with self.write_lock:
+                try:
+                    logger.info("[AGY Run] 发送 Ctrl+C 中断指令...")
+                    # \x03 代表 ASCII 控制字符 Ctrl+C
+                    self.pty.write("\x03\x03\x03")
+                except Exception as e:
+                    logger.error(f"[AGY Run] 发送中断信号失败: {e}")
+
+# 全局进程管理器
 agy_mgr = AgyProcessManager()
 
 def find_latest_transcript(min_mtime: float) -> Optional[Path]:
@@ -199,10 +204,13 @@ async def log_listener():
     """纯异步增量日志广播协程：无脑在后台读取最新修改日志的增量并推送到 QQ。"""
     global _current_log_path, _last_log_size, _last_sent_timestamp
 
-    def scan_last_sent_timestamp(log_path: Path) -> str:
-        """从指定日志文件中扫描最后一次模型回复的时间戳"""
+    # 启动时，先扫描并绑定目前最新的日志（以当前 24 小时前为基线）
+    init_log = find_latest_transcript(time.time() - 86400.0)
+    if init_log:
+        _current_log_path = init_log
         try:
-            with open(log_path, 'r', encoding='utf-8', errors='replace') as f:
+            _last_log_size = init_log.stat().st_size
+            with open(init_log, 'r', encoding='utf-8', errors='replace') as f:
                 lines = f.read().splitlines()
             for line in reversed(lines):
                 line = line.strip()
@@ -211,34 +219,14 @@ async def log_listener():
                 try:
                     obj = json.loads(line)
                     if obj.get("type") == "PLANNER_RESPONSE" and obj.get("source") == "MODEL":
-                        content = obj.get("content", "")
-                        if isinstance(content, list):
-                            text = "\n".join(
-                                item.get("text", "") for item in content
-                                if isinstance(item, dict) and item.get("type") == "text"
-                            )
-                        else:
-                            text = str(content)
-                        if text.strip():
-                            ts = obj.get("created_at")
-                            if ts:
-                                return ts
+                        ts = obj.get("created_at")
+                        if ts:
+                            _last_sent_timestamp = ts
+                            break
                 except Exception:
                     continue
         except OSError:
-            pass
-        return ""
-
-    # 启动时，先扫描并绑定目前最新的日志（以当前 24 小时前为基线）
-    init_log = find_latest_transcript(time.time() - 86400.0)
-    if init_log:
-        _current_log_path = init_log
-        try:
-            _last_log_size = init_log.stat().st_size
-            _last_sent_timestamp = scan_last_sent_timestamp(init_log)
-        except OSError:
             _last_log_size = 0
-            _last_sent_timestamp = ""
         logger.info(f"[Listener] Bound to existing active log: {_current_log_path} (size={_last_log_size}, last_ts={_last_sent_timestamp})")
 
     while _running:
@@ -249,13 +237,8 @@ async def log_listener():
             latest_log = find_latest_transcript(time.time() - 86400.0)
             if latest_log and (not _current_log_path or latest_log != _current_log_path):
                 _current_log_path = latest_log
-                try:
-                    _last_log_size = latest_log.stat().st_size
-                    _last_sent_timestamp = scan_last_sent_timestamp(latest_log)
-                except OSError:
-                    _last_log_size = 0
-                    _last_sent_timestamp = ""
-                logger.info(f"[Listener] Switched to newer active log: {_current_log_path} (size={_last_log_size}, last_ts={_last_sent_timestamp})")
+                _last_log_size = 0  # 绑定全新文件，从头读起
+                logger.info(f"[Listener] Switched to newer active log: {_current_log_path}")
         except Exception as e:
             logger.error(f"[Listener] Scan error: {e}")
 
@@ -277,26 +260,16 @@ async def log_listener():
         if curr_size <= _last_log_size:
             continue
 
-        # 3. 增量读取新行（解决 Windows 下行写入缓冲不完整导致 JSON 解析失败的并发问题）
+        # 3. 增量读取新行
         try:
-            with open(_current_log_path, 'rb') as f:
+            with open(_current_log_path, 'r', encoding='utf-8', errors='replace') as f:
                 f.seek(_last_log_size)
-                chunk = f.read()
+                new_lines = f.read().splitlines()
         except OSError:
             continue
 
-        if not chunk:
-            continue
-
-        # 确保只有包含换行符的完整行才被消费，剩余部分留到下次读取
-        last_newline_idx = chunk.rfind(b'\n')
-        if last_newline_idx == -1:
-            continue
-
-        complete_part = chunk[:last_newline_idx + 1]
-        _last_log_size += len(complete_part)
-
-        new_lines = complete_part.decode('utf-8', errors='replace').splitlines()
+        # 更新指针
+        _last_log_size = curr_size
 
         # 4. 解析增量行
         for line in new_lines:
@@ -457,6 +430,8 @@ async def handle_c2c_message(d: dict):
         return
 
     content = str(d.get("content", "")).strip()
+    
+    # 支持多模态附件识别（图片、文件、语音等），零过滤透传大模型
     attachments = d.get("attachments") or []
     for att in attachments:
         url = att.get("url")
@@ -494,18 +469,20 @@ async def handle_c2c_message(d: dict):
         logger.info(f"[Skip] non-master openid: {user_openid}")
         return
 
-    # 命令处理
+    # 🛠️ 交互指令处理 (重构版)
     if content.strip().lower() in ["/new", "/reset", "/清空", "/新对话"]:
         logger.info("[Recv] New session command received")
+        # 强杀并重启一个不带 -c 参数的新会话
         agy_mgr.start(fresh=True)
-        reply = "✅ 已重置 AGY 进程并拉起全新会话。上下文已完全清空。"
+        reply = "✅ 已重置后台 ConPTY 会话，拉起全新 AGY 进程。上下文已完全清空。"
         await send_message_rest(user_openid, reply)
         return
 
     if content.strip().lower() in ["/stop", "/停止", "/kill"]:
         logger.info("[Recv] Stop command received")
-        agy_mgr.terminate()
-        reply = "⛔ 已终止本地 AGY 运行实例。"
+        # 物理写入 Ctrl+C 中断信号，让命令行停下
+        await agy_mgr.send_ctrl_c()
+        reply = "⛔ 已向后台终端发送 Ctrl+C 中断信号，尝试终止正在执行的任务。"
         await send_message_rest(user_openid, reply)
         return
 
@@ -609,7 +586,7 @@ async def _heartbeat_sender(ws, interval: float):
         while _running and ws and not ws.closed:
             await asyncio.sleep(interval)
             
-            # Watchdog check for silent network drop
+            # 僵尸连接检测看门狗
             now = time.time()
             if now - _last_heartbeat_ack_time > interval * 2.5:
                 logger.warning(f"Heartbeat ACK timeout ({now - _last_heartbeat_ack_time:.1f}s ago). Force closing socket...")
@@ -633,7 +610,7 @@ async def main():
     # 启动后台异步日志监听服务
     asyncio.create_task(log_listener())
 
-    # 首次启动拉起本地 agy
+    # 首次启动拉起本地保活终端
     agy_mgr.start(fresh=False)
 
     try:
@@ -642,8 +619,6 @@ async def main():
     except Exception as e:
         logger.error(f"Failed to get gateway: {e}")
         sys.exit(1)
-
-    # aiohttp imported at top
 
     while _running:
         try:
@@ -668,24 +643,7 @@ async def main():
     logger.info("Bridge stopped")
 
 
-import socket
-
-_lock_socket = None
-
-def acquire_single_instance_lock():
-    global _lock_socket
-    try:
-        _lock_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        _lock_socket.bind(("127.0.0.1", 28712))
-        return True
-    except socket.error:
-        return False
-
-
 if __name__ == "__main__":
-    if not acquire_single_instance_lock():
-        logger.error("Another instance of agy_qq_bridge_win.py is already running. Exiting.")
-        sys.exit(0)
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
