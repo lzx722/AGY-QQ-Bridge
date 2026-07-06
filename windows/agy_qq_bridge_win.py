@@ -58,7 +58,7 @@ HEARTBEAT_INTERVAL = 15.0
 USER_PROFILE = os.environ.get("USERPROFILE", str(Path.home()))
 BRAIN_DIR = Path(os.environ.get("BRAIN_DIR", str(Path(USER_PROFILE) / ".gemini/antigravity-cli/brain")))
 LOG_DIR = Path(os.environ.get("LOG_DIR", str(Path(USER_PROFILE) / ".agy-qq-bridge")))
-AGY_CMD = os.environ.get("AGY_START_CMD", "agy.cmd --dangerously-skip-permissions")
+AGY_CMD = os.environ.get("AGY_START_CMD", "C:\\Users\\Administrator\\AppData\\Local\\agy\\bin\\agy.exe --dangerously-skip-permissions")
 # ==========================================
 
 os.makedirs(LOG_DIR, exist_ok=True)
@@ -643,7 +643,25 @@ async def main():
     logger.info("Bridge stopped")
 
 
+
+import socket
+
+_lock_socket = None
+
+def acquire_single_instance_lock():
+    global _lock_socket
+    try:
+        _lock_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        _lock_socket.bind(("127.0.0.1", 28712))
+        return True
+    except socket.error:
+        return False
+
+
 if __name__ == "__main__":
+    if not acquire_single_instance_lock():
+        logger.error("Another instance of agy_qq_bridge_win.py is already running. Exiting.")
+        sys.exit(0)
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
