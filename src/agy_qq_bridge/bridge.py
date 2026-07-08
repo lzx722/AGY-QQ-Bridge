@@ -87,10 +87,44 @@ _last_msg_id: Optional[str] = None
 _bot_openid: str = ""
 heartbeat_task = None
 
+# === 异步群聊缓存与动态路由 ===
+GROUP_CHAT_BUFFER = []
+LAST_MESSAGE_SOURCE = {"type": "c2c", "openid": "", "reply_to": None}
+
 # === 异步监听状态 ===
 _last_log_size = 0
 _current_log_path = None
 _last_sent_timestamp = ""  # 记录最后发送给 QQ 的消息时间戳，防重与防历史刷屏
+
+
+async def send_group_message_rest(group_openid: str, content: str, reply_to: Optional[str] = None) -> bool:
+    """给指定群聊发送消息"""
+    token = await ensure_token()
+    client = get_http_client()
+    headers = {
+        "Authorization": f"QQBot {token}",
+        "Content-Type": "application/json",
+        "User-Agent": "AGY-QQ-Bridge/2.0",
+    }
+    msg_seq = _next_msg_seq(group_openid)
+    display_content = content[:3990] + "\n\n... (已截断)" if len(content) > 4000 else content
+    body = {"markdown": {"content": display_content}, "msg_type": 2, "msg_seq": msg_seq}
+    if reply_to:
+        body["msg_id"] = reply_to
+
+    try:
+        resp = await client.post(
+            f"{API_BASE}/v2/groups/{group_openid}/messages",
+            headers=headers, json=body, timeout=30.0,
+        )
+        if resp.status_code >= 400:
+            logger.error(f"Send group failed [{resp.status_code}]: {resp.text[:200]}")
+            return False
+        return True
+    except Exception as e:
+        logger.error(f"Send group exception: {e}")
+        return False
+
 
 
 def find_latest_transcript(min_mtime: float) -> Optional[Path]:
@@ -240,7 +274,14 @@ async def log_listener():
                     logger.info(f"[Listener -> QQ] Broadcasting response (ts={ts}): {text[:100]}")
                     if ts:
                         _last_sent_timestamp = ts
-                    await send_message_rest(MASTER_OPENID, text)
+                    # 动态路由选择投递渠道
+                    target = LAST_MESSAGE_SOURCE
+                    if target["type"] == "group":
+                        await send_group_message_rest(target["openid"], text, reply_to=target["reply_to"])
+                    else:
+                        dest = target["openid"] or MASTER_OPENID
+                        if dest:
+                            await send_message_rest(dest, text)
 
 
 async def send_message_rest(user_openid: str, content: str) -> bool:
@@ -411,9 +452,13 @@ async def handle_c2c_message(d: dict):
         logger.info(f"[Skip] non-master openid: {user_openid}")
         return
 
+    # 登记当前指令来自 C2C 私发
+    LAST_MESSAGE_SOURCE = {"type": "c2c", "openid": user_openid, "reply_to": None}
+
     # 命令处理
     if content.strip().lower() in ["/new", "/reset", "/清空", "/新对话"]:
         logger.info("[Recv] New session command received")
+        GROUP_CHAT_BUFFER.clear()
 
         # 1. 强杀 tmux s0
         proc_kill = await asyncio.create_subprocess_shell(f"tmux kill-session -t {TMUX_SESSION} 2>/dev/null || true")
@@ -457,6 +502,124 @@ async def handle_c2c_message(d: dict):
     logger.info(f"[QQ -> AGY] {content}")
     # 直接发送，不等待，不阻塞
     await send_to_agy(content)
+
+
+async def handle_group_message(d: dict, event_type: str):
+    global _last_msg_id, _bot_openid, LAST_MESSAGE_SOURCE, GROUP_CHAT_BUFFER
+
+    msg_id = str(d.get("id", ""))
+    if not msg_id or is_duplicate(msg_id):
+        return
+
+    content = str(d.get("content", "")).strip()
+
+    # 提取附件
+    attachments = d.get("attachments") or []
+    for att in attachments:
+        url = att.get("url")
+        if url:
+            name = att.get("filename") or att.get("name") or "file"
+            content += f"\n\n[附件({name}): {url}]"
+
+    content = content.strip()
+    group_openid = str(d.get("group_openid", ""))
+    author = d.get("author") if isinstance(d.get("author"), dict) else {}
+    member_openid = str(author.get("member_openid", ""))
+
+    if not group_openid or not content:
+        return
+
+    sender_name = author.get("nickname") or author.get("username")
+    if not sender_name:
+        sender_name = f"user_{member_openid[-6:]}" if member_openid else "User"
+
+    # 过滤 @ 机器人的前缀
+    clean_content = content
+    if _bot_openid:
+        clean_content = clean_content.replace(f"<@!{_bot_openid}>", "").strip()
+
+    msg_line = f"[{sender_name}] {clean_content}"
+
+    is_mentioned = False
+    if event_type == "GROUP_AT_MESSAGE_CREATE":
+        is_mentioned = True
+    else:
+        mentions = d.get("mentions") or []
+        for m in mentions:
+            if m.get("is_you") is True:
+                is_mentioned = True
+                break
+            mid = m.get("member_openid") or m.get("id") or m.get("user_openid") or ""
+            if _bot_openid and str(mid) == str(_bot_openid):
+                is_mentioned = True
+                break
+
+    if not is_mentioned:
+        # 没被 @ 时默默记录到缓冲中
+        GROUP_CHAT_BUFFER.append(msg_line)
+        if len(GROUP_CHAT_BUFFER) > 100:
+            GROUP_CHAT_BUFFER.pop(0)
+        logger.info(f"[Group Buffer] From {sender_name}: {clean_content[:50]}")
+        return
+
+    _last_msg_id = msg_id
+    logger.info(f"[Group Recv AT] From {sender_name}: {clean_content[:100]}")
+
+    # 动态更新路由指向此群聊
+    LAST_MESSAGE_SOURCE = {"type": "group", "openid": group_openid, "reply_to": msg_id}
+
+    # 判断发送人是否是主人授权执行命令
+    is_master = (member_openid == MASTER_OPENID)
+
+    if is_master and clean_content.lower() in ["/new", "/reset", "/清空", "/新对话"]:
+        logger.info("[Group Recv] Reset command received")
+        proc_kill = await asyncio.create_subprocess_shell(f"tmux kill-session -t {TMUX_SESSION} 2>/dev/null || true")
+        await proc_kill.communicate()
+        await asyncio.sleep(0.5)
+        proc_new = await asyncio.create_subprocess_exec("tmux", "new-session", "-d", "-s", TMUX_SESSION)
+        await proc_new.communicate()
+        await asyncio.sleep(2.0)
+        proc_start = await asyncio.create_subprocess_exec(
+            "tmux", "send-keys", "-t", f"{TMUX_SESSION}:", AGY_START_CMD, "Enter"
+        )
+        await proc_start.communicate()
+        await asyncio.sleep(4.0)
+        proc_enter = await asyncio.create_subprocess_exec(
+            "tmux", "send-keys", "-t", f"{TMUX_SESSION}:", "Enter", ""
+        )
+        await proc_enter.communicate()
+
+        GROUP_CHAT_BUFFER.clear()
+        reply = "✅ 已强杀并重建 tmux 会话，重新拉起全新 AGY。上下文与群聊缓存已完全重置。"
+        await send_group_message_rest(group_openid, reply, reply_to=msg_id)
+        return
+
+    if is_master and clean_content.lower() in ["/stop", "/停止", "/kill"]:
+        logger.info("[Group Recv] Stop command received")
+        for key in ["C-c", "Enter", "C-c"]:
+            proc = await asyncio.create_subprocess_exec(
+                "tmux", "send-keys", "-t", f"{TMUX_SESSION}:", key, ""
+            )
+            await proc.communicate()
+            await asyncio.sleep(0.3)
+        reply = "⛔ 已发送终止信号并尝试恢复命令行。"
+        await send_group_message_rest(group_openid, reply, reply_to=msg_id)
+        return
+
+    # 拼接群聊历史上下文
+    full_payload = ""
+    if GROUP_CHAT_BUFFER:
+        full_payload += "以下是之前的群聊讨论上下文：\n"
+        full_payload += "\n".join(GROUP_CHAT_BUFFER)
+        full_payload += "\n\n请针对上述讨论，回答我当前的提问：\n"
+
+    full_payload += f"[{sender_name}] {clean_content}"
+
+    # 消费后立即清空缓存队列，绝对不循环发送旧消息
+    GROUP_CHAT_BUFFER.clear()
+
+    logger.info(f"[Group -> AGY Terminal] Sending packed payload size: {len(full_payload)}")
+    await send_to_agy(full_payload)
 
 
 async def event_loop(ws):
@@ -507,6 +670,9 @@ async def event_loop(ws):
                         logger.info("Session resumed")
                     elif t == "C2C_MESSAGE_CREATE":
                         task = asyncio.create_task(handle_c2c_message(d))
+                        task.add_done_callback(lambda t: t.exception() if not t.cancelled() else None)
+                    elif t in {"GROUP_AT_MESSAGE_CREATE", "GROUP_MESSAGE_CREATE"}:
+                        task = asyncio.create_task(handle_group_message(d, t))
                         task.add_done_callback(lambda t: t.exception() if not t.cancelled() else None)
                     continue
 
