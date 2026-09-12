@@ -30,37 +30,37 @@ graph TD
 
 ## 🛠️ 安装与运行
 
-### 1. 
+### 1. 环境准备
 
- Python 3  `tmux`
+需要 Python 3.9+ 环境。Linux 环境推荐安装 `tmux`；Windows 原生环境无需额外系统组件，已原生支持 ConPTY。
 
 ```bash
-#  pip 
+# 从源码或 pip 安装
 pip install git+https://github.com/zz327455573/AGY-QQ-Bridge.git
 
-#  --init  bin
+# 查看已安装的可执行命令
 which agy-qq-bridge
 ```
 
-### 2.  
+### 2. 配置环境变量
 
 ```bash
-#  pip  --init 
+# 方式 A：通过交互式命令引导生成配置
 agy-qq-bridge --init
 
-#  .env  .env 
+# 方式 B：直接复制配置文件模板
 cp .env.example .env
 ```
 
- .env 
+核心 `.env` 配置参数说明：
 
-*   `APP_ID` / `CLIENT_SECRET`QQ 
-*   `MASTER_OPENID` QQ C2C OpenID `--init` 
-*   `TMUX_SESSION` AGY  tmux  `0`
-*   `AGY_START_CMD` AGY  AGY  tmux 
-    *  `cd ~ && agy --dangerously-skip-permissions`
-    *  `script -q -c "/root/.local/bin/agy --dangerously-skip-permissions" /dev/null`  agy  PATH script 
-*   `BRAIN_DIR`AGY  `brain/`  `~/.gemini/antigravity-cli/brain`
+*   `APP_ID` / `CLIENT_SECRET`：QQ 开放平台机器人凭证
+*   `MASTER_OPENID`：机器人的管理员 QQ C2C OpenID（留空时首次私聊会自动绑定）
+*   `TMUX_SESSION`：AGY 运行的 tmux 会话名（默认 `0`）
+*   `AGY_START_CMD`：AGY 启动命令
+    *   Linux 示例：`cd ~ && agy --dangerously-skip-permissions`
+    *   Windows 示例：`C:\Users\Administrator\AppData\Local\agy\bin\agy.exe --dangerously-skip-permissions`
+*   `BRAIN_DIR`：AGY 脑部结构化日志存放路径（默认为 `~/.gemini/antigravity-cli/brain`）
 
 ### 3. 使用 PM2 进行守护与热启动
 

@@ -61,18 +61,30 @@ AGY-QQ-Bridge/
 ├── pyproject.toml             # Python 项目元数据
 ├── requirements.txt           # 核心依赖清单
 ├── .env.example               # 环境变量配置模板
-├── agy-qq-bridge.py           # Linux 单文件启动入口
+├── agy-qq-bridge.py           # 向后兼容启动入口（Linux / 通用）
 ├── agy-conversation-monitor.py# 本地与 QQ 双通道日志监控工具
 ├── 启动机器人.bat              # Windows 一键启动脚本
 ├── manage_menu_panel.py       # QQ 开放平台自定义菜单与指令面板管理工具
+├── tests/                     # 自动化测试套件
+│   └── test_refactor.py       # 模块重构与核心交互指令单元测试
 ├── src/
-│   └── agy_qq_bridge/         # Linux / 通用模块化实现
+│   └── agy_qq_bridge/         # 核心模块化分层架构
 │       ├── __init__.py
 │       ├── __main__.py
-│       └── bridge.py          # 基于 tmux 的 Linux 核心桥接实现
+│       ├── config.py          # 环境与配置中心（.env加载、网络常量、路径与DNS修复）
+│       ├── diagnostics.py     # 零 Token 消耗的本地 Git 与工作区秒级诊断
+│       ├── session_manager.py # 会话生命周期（历史检视、Triple Persistence重命名、90s/3次跳转）
+│       ├── terminal/          # 虚拟终端抽象层
+│       │   ├── __init__.py    # 自适应终端工厂函数 create_terminal_manager()
+│       │   ├── base.py        # BaseTerminalManager 虚拟终端抽象基类
+│       │   ├── tmux.py        # Linux TmuxTerminalManager 终端管理器
+│       │   └── winpty.py      # Windows WinptyTerminalManager 终端管理器（ConPTY + \x1b[c握手）
+│       ├── qq_client.py       # QQ OpenAPI 通信、REST 收发、菜单面板同步与 WS 事件监听
+│       ├── log_listener.py    # transcript.jsonl 增量偏移寻址（seek）、截断自愈与模型回复广播
+│       └── bridge.py          # 核心调度中心 BridgeApp
 ├── windows/
 │   ├── README.md              # Windows 原生部署说明
-│   └── agy_qq_bridge_win.py   # 基于 Windows ConPTY 的原生桥接实现
+│   └── agy_qq_bridge_win.py   # Windows 原生轻量启动入口（调用 WinptyTerminalManager）
 ├── docs/                      # 架构演化案例与研究报告
 │   ├── CASE_STUDY.md          # 终端交互方案的演进历史
 │   ├── EXECUTIVE_BRIEF.md     # 系统边界与架构摘要
@@ -82,22 +94,22 @@ AGY-QQ-Bridge/
 
 ---
 
-## 3. 双平台运行时架构差异
+## 3. 双平台运行时架构差异与模块分层
 
-由于 Linux 与 Windows 底层终端子系统的差异，本项目维护了双套终端管理实现：
+本项目采用清晰的分层解耦设计，平台差异完全隔离在终端适配层：
 
-| 特性 / 组件 | Linux 运行时 ([bridge.py](file:///E:/Git/AGY-QQ-Bridge/src/agy_qq_bridge/bridge.py)) | Windows 运行时 ([agy_qq_bridge_win.py](file:///E:/Git/AGY-QQ-Bridge/windows/agy_qq_bridge_win.py)) |
+| 特性 / 组件 | Linux 运行时 ([terminal/tmux.py](file:///E:/Git/AGY-QQ-Bridge/src/agy_qq_bridge/terminal/tmux.py)) | Windows 运行时 ([terminal/winpty.py](file:///E:/Git/AGY-QQ-Bridge/src/agy_qq_bridge/terminal/winpty.py)) |
 | :--- | :--- | :--- |
 | **终端载体** | `tmux` Session（默认名称 `0`） | Windows 伪控制台 ConPTY (`pywinpty.PtyProcess`) |
 | **消息发送方式** | `tmux send-keys -t 0 message Enter` | `PtyProcess.write(message + "\r\n")` |
 | **启动挂起处理** | 原生 PTY，通常无需终端探测握手 | 自动应答终端能力探测 (`\x1b[c` $\rightarrow$ `\x1b[?1;2c`) |
-| **异步网络解析** | 默认 asyncio resolver | 修复 Windows Proactor 事件循环：使用 `ThreadedResolver` |
+| **异步网络解析** | 默认 asyncio resolver | 修复 Windows Proactor 事件循环：使用 `ThreadedResolver`（位于 `config.py`） |
 | **会话隔离机制** | 单用户独立环境 | `AGY_WORKSPACE` 工作区隔离 + Prompt 指纹内容比对 |
 | **服务保活方式** | `pm2` / `systemd` | Windows 任务计划程序 / `nssm` / 批处理 |
 | **打断安全策略 (`/stop`)** | 结合 `is_busy` 状态：空闲发 `Escape`；忙碌发 `C-c` + `Escape` | 结合 `is_busy` 状态：空闲发 `\x1b` 防误退；忙碌发单次 `\x03` + `\x1b` 且带进程自愈守护 |
 | **会话检视与切换 (`/history`, `/resume`)** | 智能路径解析 + 杀旧建新 tmux session + `cd <cwd>` + `--conversation <id>` + 跳过历史日志绑定 | 智能路径解析 + 杀旧建新 ConPTY 进程 + `cwd=<cwd>` + `--conversation <id>` + 跳过历史日志绑定 |
-| **会话重命名持久化 (`/rename`)** | 三重持久化（`annotations/<cid>.pbtxt` + `cache/conversation_metadata.json` + `conversation_summaries.db`） | 三重持久化（`annotations/<cid>.pbtxt` + `cache/conversation_metadata.json` + `conversation_summaries.db`） |
-| **菜单/面板自同步** | 启动时异步协程调用 `_sync_menu_and_panels()` | 启动时异步协程调用 `_sync_menu_and_panels()` |
+| **会话重命名持久化 (`/rename`)** | 三重持久化（`session_manager.py`：`annotations/<cid>.pbtxt` + `cache/conversation_metadata.json` + `conversation_summaries.db`） | 三重持久化（`session_manager.py`：`annotations/<cid>.pbtxt` + `cache/conversation_metadata.json` + `conversation_summaries.db`） |
+| **菜单/面板自同步** | 启动时异步协程调用 `qq_client.sync_menu_and_panels()` | 启动时异步协程调用 `qq_client.sync_menu_and_panels()` |
 
 ---
 
