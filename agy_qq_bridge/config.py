@@ -25,6 +25,7 @@ def load_env(env_path: str = ".env") -> None:
     candidates = [
         Path(env_path),
         Path(__file__).parent / env_path,
+        Path(__file__).parent.parent / env_path,
         Path(__file__).parent.parent.parent / env_path,
         Path.cwd() / env_path,
         Path.home() / ".env",

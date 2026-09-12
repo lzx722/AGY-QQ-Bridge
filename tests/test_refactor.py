@@ -6,8 +6,8 @@ import sys
 import time
 from pathlib import Path
 
-# 添加 src 到路径
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+# 添加项目根目录到路径
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from agy_qq_bridge.session_manager import (
     validate_rename_title,
