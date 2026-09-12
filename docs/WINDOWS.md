@@ -8,12 +8,12 @@
 
 由于 Windows 系统不支持原生的 `tmux`，本项目采用 Windows 伪控制台 **ConPTY**（基于 `pywinpty`）与核心模块化架构：
 
-*   **模块化分层**：基于核心 `src/agy_qq_bridge` 分层架构，Windows 入口文件 `windows/agy_qq_bridge_win.py` 仅保留终端适配与启动编排，核心调度、QQ OpenAPI、日志监听与会话管理全局复用。
+*   **模块化分层**：基于核心 `agy_qq_bridge` 模块化架构，终端适配、核心调度、QQ OpenAPI、日志监听与会话管理全局复用。
 *   **ConPTY 进程常驻保活**：在后台拉起常驻 ConPTY 虚拟终端，保持 `agy` 进程处于持续交互就绪状态。
 *   **终端握手自愈 (`\x1b[c`)**：后台排空协程自动识别并应答 AGY 启动时的设备能力探测请求（`\x1b[c` $\rightarrow$ `\x1b[?1;2c`），杜绝启动挂起。
 *   **按键流物理模拟**：通过 Windows 虚拟终端句柄直接模拟物理键盘输入（`\r\n`），支持 Escape 退出 TUI / PAGER 卡死状态。
 *   **解耦增量日志读取**：输出端通过增量文件偏移（seek）读取 `transcript.jsonl`，实现输入与输出完全解耦，支持一次输入多次回复。
-*   **单实例防双开锁**：内置本地 TCP 端口（28712）互斥锁，防止重复点击导致多实例冲突。
+*   **内置单实例防双开锁**：内置本地 TCP 端口（28712）互斥锁，防止重复点击导致多实例冲突。
 
 ---
 
@@ -21,14 +21,14 @@
 
 ### 1. 安装 Windows 环境依赖
 
-在 Windows 控制台（PowerShell 或 CMD）中执行以下命令：
+在 Windows 控制台（PowerShell 或 CMD）中执行以下命令（自动安装 Windows 依赖 `pywinpty`、`httpx` 与 `aiohttp`）：
 ```powershell
-pip install pywinpty httpx aiohttp
+pip install -e .
 ```
 
 ### 2. 配置环境变量
 
-在项目根目录或 `windows/` 目录下创建 `.env` 环境变量配置文件：
+在项目根目录下创建 `.env` 环境变量配置文件：
 ```env
 APP_ID=你的QQ机器人AppID
 CLIENT_SECRET=你的QQ机器人密钥
@@ -44,11 +44,10 @@ LOG_DIR=C:\Users\Administrator\.agy-qq-bridge
 *   **快捷启动**：直接双击项目根目录下的 **`A启动机器人.bat`** 即可。
 *   **命令行启动**：
     ```powershell
-    cd windows
-    python agy_qq_bridge_win.py
+    python -m agy_qq_bridge
     ```
 *   **开机后台自启（可选）**：
-    推荐使用 `NSSM` 或 Windows 任务计划程序将 `A启动机器人.bat` 或 `agy_qq_bridge_win.py` 包装为标准的系统后台服务。
+    推荐使用 `NSSM` 或 Windows 任务计划程序将 `A启动机器人.bat` 包装为标准的系统后台服务。
 
 ---
 

@@ -1,5 +1,7 @@
 # AGY-QQ-Bridge: 极简 C2C 异步日志增量 QQ 桥接器
 
+[![Repo](https://img.shields.io/badge/GitHub-lzx722%2FAGY--QQ--Bridge-blue?logo=github)](https://github.com/lzx722/AGY-QQ-Bridge)
+[![Original Author](https://img.shields.io/badge/致敬原作者-zz327455573-orange)](https://github.com/zz327455573/AGY-QQ-Bridge)
 [![Agent Keep](https://img.shields.io/badge/🏠_Agent_Keep-生态项目-blue)](https://github.com/zz327455573/agent-keep)
 
 AGY-QQ-Bridge 是一个用于将本地常驻运行的 Google Antigravity (AGY) 实例直连到 QQ 个人私聊通道的轻量级桥接系统。
@@ -39,58 +41,96 @@ flowchart TD
 
 *   **输入输出完全解耦**：QQ 消息只管模拟按键送入终端，后台协程只管增量监听日志并广播回传。无忙碌锁、无同步超时死锁。
 *   **支持“一次输入，多次回复”**：完美契合 AI 助手在执行长耗时任务时分步骤、断断续续地汇报进度的行为特征，保证所有发出的文字 100% 被捕获回传。
-*   **跨平台原生虚拟终端**：Linux 原生适配 `tmux`；Windows 原生适配微软伪控制台 `ConPTY`，自动完成 `\x1b[c` 握手探测应答并具备进程保活自愈能力。
+*   **跨平台原生虚拟终端**：Linux 原生适配 `tmux`；Windows 原生适配微软伪控制台 `ConPTY`，自动完成 `\x1b[c` 握手探测应答并具备进程保活自愈与单实例端口锁防护。
 *   **自适应重置与热绑定**：在执行 `/new` 切换或重置会话时，监听器会在 0.5 秒内自动绑定新生成的日志文件，并自动定位水位线，杜绝任何历史消息的重复刷屏与多实例逻辑混乱。
 
 ---
 
-## 🛠️ 安装与运行
+## 🛠️ 安装与运行指南
 
-### 1. 环境准备
-
-需要 Python 3.10+ 环境。Linux 环境推荐安装 `tmux`；Windows 原生环境无需额外系统组件，已原生支持 ConPTY。
+### 步骤 1：克隆项目仓库
 
 ```bash
-# 从源码或 pip 安装
-pip install git+https://github.com/zz327455573/AGY-QQ-Bridge.git
-
-# 查看已安装的可执行命令
-which agy-qq-bridge
+git clone https://github.com/lzx722/AGY-QQ-Bridge.git
+cd AGY-QQ-Bridge
 ```
 
-### 2. 配置环境变量
+### 步骤 2：安装依赖环境（推荐 Python 3.10+）
+
+本项目采用现代 Python `pyproject.toml` 标准打包规范，内置全平台自适应依赖声明（在 Windows 环境下会自动额外安装 `pywinpty`）：
 
 ```bash
-# 方式 A：通过交互式命令引导生成配置
-agy-qq-bridge --init
+# 方式 A（推荐：以可编辑开发者模式安装，便于修改与同步）：
+pip install -e .
 
-# 方式 B：直接复制配置文件模板
+# 方式 B（标准本地安装）：
+pip install .
+```
+
+> **系统前置条件说明**：
+> * **Linux 用户**：需要系统中已安装 `tmux`（`apt install tmux` 或 `yum install tmux`）。
+> * **Windows 用户**：无需额外系统工具，已通过 ConPTY 原生支持伪终端。详见 [docs/WINDOWS.md](docs/WINDOWS.md)。
+
+---
+
+### 步骤 3：配置环境变量 (`.env`)
+
+复制环境变量配置模板，并在根目录下创建 `.env`：
+
+```bash
+# Linux / macOS
 cp .env.example .env
+
+# Windows CMD / PowerShell
+copy .env.example .env
 ```
 
-核心 `.env` 配置参数说明：
+打开 `.env` 并填入必要凭据：
 
-*   `APP_ID` / `CLIENT_SECRET`：QQ 开放平台机器人凭证（必须）
-*   `MASTER_OPENID`：机器人的管理员 QQ OpenID（留空时首次私聊会自动绑定）
-*   `AGY_START_CMD`：AGY 启动命令
-    *   Linux 示例：`cd ~ && agy --dangerously-skip-permissions`
-    *   Windows 示例：`C:\Users\Administrator\AppData\Local\agy\bin\agy.exe --dangerously-skip-permissions`
-*   `AGY_WORKSPACE`：机器人专属独立工作区目录（推荐配置，彻底杜绝与本地 IDE 开发会话串台）
-*   `BRAIN_DIR`：AGY 脑部结构化日志存放路径（默认为 `~/.gemini/antigravity-cli/brain`）
-*   `LOG_DIR`：桥接服务运行日志存储目录（默认 `~/.agy-qq-bridge`）
-*   `TMUX_SESSION`：Linux 环境下 AGY 运行的 tmux 会话名（默认 `0`）
+```env
+# 核心凭证（必须）
+APP_ID=你的QQ机器人AppID
+CLIENT_SECRET=你的QQ机器人Secret
+MASTER_OPENID=你的管理员OpenID（留空时首次私聊会自动绑定）
 
-### 3. 使用 PM2 进行守护与热启动
+# 启动与路径配置
+AGY_START_CMD=C:\Users\Administrator\AppData\Local\agy\bin\agy.exe --dangerously-skip-permissions
+AGY_WORKSPACE=C:\Users\Administrator\.agy-qq-bridge\workspace   # 机器人独立工作区（推荐设置）
+BRAIN_DIR=C:\Users\Administrator\.gemini\antigravity-cli\brain
+LOG_DIR=C:\Users\Administrator\.agy-qq-bridge
 
-推荐使用 Node.js 的进程管理器 `pm2` 来保证桥接服务的持续运行：
-```bash
-# 启动桥接服务
-pm2 start agy-qq-bridge.py --name agy-qq-bridge
-
-# 查看运行状态与实时日志
-pm2 status
-pm2 logs agy-qq-bridge
+# Linux 环境专用
+TMUX_SESSION=0                                                 # tmux 会话名称（默认 0）
 ```
+
+---
+
+### 步骤 4：启动机器人
+
+#### 🪟 Windows 用户：
+* **快捷一键启动**：直接双击项目根目录下的 **`A启动机器人.bat`**。
+* **命令行启动**：
+  ```powershell
+  python -m agy_qq_bridge
+  ```
+  *(注：已内置 28712 端口单实例互斥锁，避免误双击造成多开冲突)*
+
+#### 🐧 Linux 用户：
+* **命令行直接运行**：
+  ```bash
+  python3 -m agy_qq_bridge
+  # 或使用安装后的控制台命令
+  agy-qq-bridge
+  ```
+* **使用 PM2 后台常驻保活（推荐）**：
+  ```bash
+  pm2 start "python3 -m agy_qq_bridge" --name agy-qq-bridge
+  pm2 save
+  
+  # 查看运行状态与实时日志
+  pm2 status
+  pm2 logs agy-qq-bridge
+  ```
 
 ---
 
@@ -121,21 +161,21 @@ pm2 logs agy-qq-bridge
 
 ### 自动化注册与管理 (`menu_panel`)
 
-* **全自动零干预注册**：桥接服务（Windows `agy_qq_bridge_win.py` 与 Linux `bridge.py`）在启动时由后台原生异步协程（`menu_panel.py`）自动向 QQ 开放平台注册/同步单聊自定义菜单与 C2C/群聊指令面板，**完全无需任何手动配置**。
+* **全自动零干预注册**：桥接服务在启动时由后台原生异步协程（`menu_panel.py`）自动向 QQ 开放平台注册/同步单聊自定义菜单与 C2C/群聊指令面板，**完全无需任何手动配置**。
 * **手动排障/查询（可选）**：
-  若需手动检查或重置开放平台菜单，可执行排障命令（或在安装包后使用 `python -m agy_qq_bridge.menu_panel`）：
+  若需手动检查或重置开放平台菜单，可执行排障命令：
   ```bash
   # 1. 查询当前生效的全局自定义菜单
-  python src/agy_qq_bridge/menu_panel.py --menu-get
+  python -m agy_qq_bridge.menu_panel --menu-get
 
   # 2. 一键强制同步所有默认菜单与指令面板
-  python src/agy_qq_bridge/menu_panel.py --sync-all
+  python -m agy_qq_bridge.menu_panel --sync-all
 
   # 3. 清空全局自定义菜单
-  python src/agy_qq_bridge/menu_panel.py --menu-clear
+  python -m agy_qq_bridge.menu_panel --menu-clear
 
   # 4. 查看指令面板列表 (c2c / group)
-  python src/agy_qq_bridge/menu_panel.py --panel-list c2c
+  python -m agy_qq_bridge.menu_panel --panel-list c2c
   ```
 
 ---
@@ -143,11 +183,15 @@ pm2 logs agy-qq-bridge
 ## 📝 更新日志
 
 ### v2.2.0 (2026-09-12)
-*   **核心架构分层解耦重构**：将原先单体脚本重构为模块化架构（`config` 配置中心、`terminal` 终端抽象层、`session_manager` 会话生命周期、`qq_client` 通信客户端、`log_listener` 日志监听、`bridge` 调度中心），大幅消除冗余代码。
+*   **工程结构极致精简**：
+    *   统一采用 PEP 621 标准 `pyproject.toml` 作为唯一元数据与依赖配置，安全合并淘汰 `requirements.txt`；
+    *   将 `evidence/` 实证库规整至 `docs/evidence/`，将 Windows 套件整合为 `docs/WINDOWS.md` 并将防双开锁原生融入内核；
+    *   收敛所有散装脚本，整洁形成标准的 3 目录（`src/`、`docs/`、`tests/`）规范架构。
+*   **核心架构分层解耦重构**：模块化拆分为 `config`、`terminal`、`session_manager`、`qq_client`、`log_listener`、`bridge`。
 *   **跨平台虚拟终端抽象**：Linux (`TmuxTerminalManager`) 与 Windows (`WinptyTerminalManager`) 统一接口，自动应答 `\x1b[c` 握手并具备进程自愈能力。
 *   **会话历史与切换增强 (`/history`, `/resume`)**：
     *   原生 100% 对齐 AGY 原生规则，过滤空会话；
-    *   灵活支持范围模式（如 `/history 31-40`）、分页模式（如 `/history p4`）与单次 15 条安全上限；
+    *   支持范围模式（如 `/history 31-40`）、分页模式（如 `/history p4`）与单次 15 条安全上限；
     *   限制 `/resume` 在 `/history` 查询后 90 秒内使用且单轮最多跳转 3 次，防止误操作；
     *   移动端视觉排版优化（第一行会话名称、第二行工作区与时间，隐藏内部 UUID）。
 *   **会话重命名三重持久化 (`/rename`)**：
@@ -155,10 +199,10 @@ pm2 logs agy-qq-bridge
     *   全指令参数防御机制，严防误将 resume/history 指令或参数当做主题写入。
 *   **零 Token 诊断与智能打断**：`git status` 本地秒级直接执行；`/stop` 空闲状态发 `Escape` 防误退、忙碌状态单次 `Ctrl+C` 安全中断。
 
-### v2.1.0 (2026-07-01)
-*   支持 `--init` 交互式配置生成并支持自定义 `AGY_START_CMD`；
-*   完善 `.env.example` 与文档说明。
+---
 
-### v2.0.0 (2026-06-29)
-*   **多模态支持**：实现了附件功能的零阻拦直传。机器人接收到图片、语音（SILK格式）、视频以及任意文件后，不再进行本地缓存，而是将 QQ 临时下载 URL 自动原样透传给大模型进行原生多模态识别与解析；
-*   **代码优化**：升级 API 请求 User-Agent 头至 `AGY-QQ-Bridge/2.0`。
+## 🙏 致谢 (Credits & Acknowledgments)
+
+本项目基于 [zz327455573/AGY-QQ-Bridge](https://github.com/zz327455573/AGY-QQ-Bridge) 与 [Agent Keep](https://github.com/zz327455573/agent-keep) 生态项目进行深度重构与架构升级。
+
+由衷感谢原作者 **[zz327455573](https://github.com/zz327455573)** 及开源社区贡献者的最初探索与卓越灵感，奠定了通过增量日志监听与虚拟终端解耦操控 Antigravity CLI 的开创性思路！

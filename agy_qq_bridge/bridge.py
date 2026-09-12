@@ -4,6 +4,7 @@ agy_qq_bridge.bridge — AGY 核心桥接器与指令调度中心
 """
 import sys
 import time
+import socket
 import asyncio
 from pathlib import Path
 from typing import Optional, Dict, Any, List
@@ -38,7 +39,7 @@ from .log_listener import LogListener
 
 logger = setup_logger("agy_qq_bridge")
 
-VERSION = "2.1.0"
+VERSION = "2.3.0"
 
 
 class BridgeApp:
@@ -580,6 +581,19 @@ class BridgeApp:
 # 向后兼容类名
 QQBridge = BridgeApp
 
+_lock_socket = None
+
+
+def acquire_single_instance_lock(port: int = 28712) -> bool:
+    """通过本地 TCP 端口绑定防止 Windows / 桌面环境下重复启动多个桥接实例"""
+    global _lock_socket
+    try:
+        _lock_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        _lock_socket.bind(("127.0.0.1", port))
+        return True
+    except socket.error:
+        return False
+
 
 def cli() -> int:
     """CLI 入口"""
@@ -592,6 +606,11 @@ def cli() -> int:
         print("  --help, -h       显示此帮助")
         print("  --version, -V    显示版本号")
         return 0
+
+    if sys.platform == "win32":
+        if not acquire_single_instance_lock():
+            logger.error("检测到已有 agy-qq-bridge 实例在后台运行，禁止重复启动。退出。")
+            return 0
 
     try:
         app = BridgeApp()

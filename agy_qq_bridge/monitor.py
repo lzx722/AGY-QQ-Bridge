@@ -35,8 +35,13 @@ from pathlib import Path
 from datetime import datetime
 
 # ─── 路径配置 ─────────────────────────────────────────────
-BRAIN_DIR    = Path("/root/.gemini/antigravity-cli/brain")
-BASE_DIR     = Path("/root/.agents/jiaoben/agy-memory")
+try:
+    from .config import BRAIN_DIR, LOG_DIR
+    BASE_DIR = LOG_DIR / "memory"
+except Exception:
+    BRAIN_DIR = Path(os.environ.get("BRAIN_DIR", Path.home() / ".gemini" / "antigravity-cli" / "brain"))
+    BASE_DIR = Path(os.environ.get("LOG_DIR", Path.home() / ".agy-qq-bridge")) / "memory"
+
 QQ_CONV_LOG  = BASE_DIR / "qq-conversation.log"
 OUTPUT       = BASE_DIR / "conversation.log"
 OFFSETS      = BASE_DIR / "file_offsets.json"
