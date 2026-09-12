@@ -129,11 +129,23 @@ pm2 logs agy-qq-bridge
 
 ## 📝 更新日志
 
-### v2.1 (2026-07-01)
-*   `--init` AGY_START_CMD  AGY  AGY 
-*   `.env.example`  `AGY_START_CMD` 
-*   README  
+### v2.2.0 (2026-09-12)
+*   **核心架构分层解耦重构**：将原先单体脚本重构为模块化架构（`config` 配置中心、`terminal` 终端抽象层、`session_manager` 会话生命周期、`qq_client` 通信客户端、`log_listener` 日志监听、`bridge` 调度中心），大幅消除冗余代码。
+*   **跨平台虚拟终端抽象**：Linux (`TmuxTerminalManager`) 与 Windows (`WinptyTerminalManager`) 统一接口，自动应答 `\x1b[c` 握手并具备进程自愈能力。
+*   **会话历史与切换增强 (`/history`, `/resume`)**：
+    *   原生 100% 对齐 AGY 原生规则，过滤空会话；
+    *   灵活支持范围模式（如 `/history 31-40`）、分页模式（如 `/history p4`）与单次 15 条安全上限；
+    *   限制 `/resume` 在 `/history` 查询后 90 秒内使用且单轮最多跳转 3 次，防止误操作；
+    *   移动端视觉排版优化（第一行会话名称、第二行工作区与时间，隐藏内部 UUID）。
+*   **会话重命名三重持久化 (`/rename`)**：
+    *   实现 `annotations/<cid>.pbtxt` + `conversation_metadata.json` + SQLite `conversation_summaries.db` 同步更新，杜绝重启被 AGY 覆盖；
+    *   全指令参数防御机制，严防误将 resume/history 指令或参数当做主题写入。
+*   **零 Token 诊断与智能打断**：`git status` 本地秒级直接执行；`/stop` 空闲状态发 `Escape` 防误退、忙碌状态单次 `Ctrl+C` 安全中断。
 
-### v2.0 (2026-06-29)
-*   **多模态支持**：实现了附件功能的零阻拦直传。机器人接收到图片、语音（SILK格式）、视频以及任意文件后，不再进行本地缓存，而是将 QQ 临时下载 URL 自动原样透传给大模型进行原生多模态识别与解析。
+### v2.1.0 (2026-07-01)
+*   支持 `--init` 交互式配置生成并支持自定义 `AGY_START_CMD`；
+*   完善 `.env.example` 与文档说明。
+
+### v2.0.0 (2026-06-29)
+*   **多模态支持**：实现了附件功能的零阻拦直传。机器人接收到图片、语音（SILK格式）、视频以及任意文件后，不再进行本地缓存，而是将 QQ 临时下载 URL 自动原样透传给大模型进行原生多模态识别与解析；
 *   **代码优化**：升级 API 请求 User-Agent 头至 `AGY-QQ-Bridge/2.0`。
