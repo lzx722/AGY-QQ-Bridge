@@ -120,12 +120,14 @@ class AgyProcessManager:
         self.fresh_time = 0.0
         self.last_sent_prompt = ""
         self.last_sent_time = 0.0
+        self.is_busy = False
 
     def start(self, fresh=False):
         """在后台虚拟终端中拉起并常驻运行 AGY CLI"""
         global _current_log_path, _last_sent_timestamp, _last_log_size
         self.loop = asyncio.get_running_loop()
         self.needs_rebind = True
+        self.is_busy = False
         if fresh:
             self.fresh_time = time.time()
             self.last_sent_prompt = ""
@@ -193,6 +195,7 @@ class AgyProcessManager:
                 logger.info(f"[Bridge -> AGY] 写入消息: {msg}")
                 self.last_sent_prompt = msg.strip()
                 self.last_sent_time = time.time()
+                self.is_busy = True
                 # 发送 Escape 强退可能卡在 TUI 或 PAGER 的状态 (Windows下对应 \x1b)
                 self.proc.write("\x1b")
                 await asyncio.sleep(0.3)
@@ -202,14 +205,24 @@ class AgyProcessManager:
                 logger.error(f"[AGY Run] 写入虚拟终端失败: {e}")
 
     async def send_ctrl_c(self):
-        """向常驻进程发送 Ctrl+C 中断信号"""
+        """向常驻进程安全发送中断信号，打断正在执行的任务而不杀死空闲终端"""
         if self.proc and self.proc.isalive():
             async with self.write_lock:
                 try:
-                    logger.info("[AGY Run] 发送 Ctrl+C 中断指令...")
-                    self.proc.write("\x03\x03\x03")
+                    logger.info("[AGY Run] 正在发送中断信号 (Ctrl+C)...")
+                    # 单次 Ctrl+C 打断当前正在执行的子命令或生成
+                    self.proc.write("\x03")
+                    await asyncio.sleep(0.2)
+                    # 发送 Escape 确保退出所有残留交互，干净退回到提示符
+                    self.proc.write("\x1b")
                 except Exception as e:
                     logger.error(f"[AGY Run] 发送中断信号失败: {e}")
+            # 检查进程是否因极端异常退出了，若是则立刻在后台无缝拉起保活
+            await asyncio.sleep(0.3)
+            if not self.proc or not self.proc.isalive():
+                logger.warning("[AGY Run] 终端进程在中断后退出，正在自动拉起恢复...")
+                self.start(fresh=False)
+        self.is_busy = False
 
 # 全局进程管理器
 agy_mgr = AgyProcessManager()
@@ -444,6 +457,7 @@ async def log_listener():
                     logger.info(f"[Listener -> QQ] Broadcasting response (ts={ts}): {text[:100]}")
                     if ts:
                         _last_sent_timestamp = ts
+                    agy_mgr.is_busy = False
                     await send_message_rest(MASTER_OPENID, text)
 
 
@@ -566,6 +580,48 @@ def is_duplicate(msg_id: str) -> bool:
     return False
 
 
+async def get_local_git_status(workspace: Path) -> str:
+    """本地直接执行 git status，毫秒级诊断返回，零 Token 消耗"""
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "git", "-C", str(workspace), "status", "-s",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        stdout, stderr = await proc.communicate()
+        if proc.returncode != 0:
+            err_msg = stderr.decode("utf-8", errors="replace").strip()
+            return f"⚠️ 执行 `git status` 失败: {err_msg}"
+
+        status_text = stdout.decode("utf-8", errors="replace").strip()
+
+        proc_b = await asyncio.create_subprocess_exec(
+            "git", "-C", str(workspace), "branch", "--show-current",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        stdout_b, _ = await proc_b.communicate()
+        branch = stdout_b.decode("utf-8", errors="replace").strip() or "HEAD"
+
+        if not status_text:
+            return f"📁 **Git 工作区状态**\n\n• **工作区**: `{workspace}`\n• **当前分支**: `{branch}`\n\n✅ **工作区很干净，无任何未提交的代码变更。**"
+
+        lines = [l for l in status_text.splitlines() if l.strip()]
+        display_lines = "\n".join(lines[:25])
+        if len(lines) > 25:
+            display_lines += f"\n... (其余 {len(lines) - 25} 项已折叠)"
+
+        return (
+            f"📁 **Git 工作区状态**\n\n"
+            f"• **工作区**: `{workspace}`\n"
+            f"• **当前分支**: `{branch}` ({len(lines)} 项变动)\n\n"
+            f"```text\n{display_lines}\n```\n"
+            f"💡 *提示：若需让 AI 审查或提交代码，可直接输入对话「帮我提交以上变动」*"
+        )
+    except Exception as e:
+        return f"⚠️ 检查工作区失败: {e}"
+
+
 async def handle_c2c_message(d: dict):
     global _last_msg_id, _bot_openid
 
@@ -614,7 +670,7 @@ async def handle_c2c_message(d: dict):
         return
 
     # 🛠️ 交互指令处理 (重构版)
-    if content.strip().lower() in ["/new", "/reset", "/清空", "/新对话"]:
+    if content.strip().lower() in ["/new", "/reset", "/清空", "/新对话", "new", "reset"]:
         logger.info("[Recv] New session command received")
         # 强杀并重启一个不带 -c 参数的新会话
         agy_mgr.start(fresh=True)
@@ -622,11 +678,48 @@ async def handle_c2c_message(d: dict):
         await send_message_rest(user_openid, reply)
         return
 
-    if content.strip().lower() in ["/stop", "/停止", "/kill"]:
+    if content.strip().lower() in ["/stop", "/停止", "/kill", "stop"]:
         logger.info("[Recv] Stop command received")
-        # 物理写入 Ctrl+C 中断信号，让命令行停下
-        await agy_mgr.send_ctrl_c()
-        reply = "⛔ 已向后台终端发送 Ctrl+C 中断信号，尝试终止正在执行的任务。"
+        # 智能防护：如果当前没有正在执行的任务（空闲状态），发送 Escape 清理输入状态，绝不发送多次 Ctrl+C 杀退终端
+        if not agy_mgr.is_busy and (time.time() - agy_mgr.last_sent_time > 60 or agy_mgr.last_sent_time == 0):
+            if agy_mgr.proc and agy_mgr.proc.isalive():
+                async with agy_mgr.write_lock:
+                    agy_mgr.proc.write("\x1b")
+            reply = "ℹ️ 当前终端处于空闲就绪状态，未在执行耗时任务，请放心继续发送新消息。"
+        else:
+            await agy_mgr.send_ctrl_c()
+            reply = "⛔ 已向后台发送中断信号（Ctrl+C），正在打断当前任务并恢复就绪状态。"
+        await send_message_rest(user_openid, reply)
+        return
+
+    if content.strip().lower() in ["/git", "/git status", "git status", "/git diff"]:
+        logger.info("[Recv] Local git status requested")
+        reply = await get_local_git_status(AGY_WORKSPACE)
+        await send_message_rest(user_openid, reply)
+        return
+
+    if content.strip().lower() in ["/help", "/帮助", "帮助", "help"]:
+        reply = (
+            "🤖 **AGY-QQ-Bridge 控制中心**\n\n"
+            "• `/new` 或 `/清空`：重置后台终端，开启全新无上下文会话\n"
+            "• `/stop` 或 `/停止`：向后台发送 Ctrl+C 中断信号终止当前任务\n"
+            "• `/status` 或 `/状态`：查看当前工作区与会话绑定状态\n"
+            "• 直接发送文本：自动输入给后台 Google Antigravity CLI\n"
+            "• 发送图片/文件：原生直链由 AGY 视觉与多模态解析"
+        )
+        await send_message_rest(user_openid, reply)
+        return
+
+    if content.strip().lower() in ["/status", "/状态", "status"]:
+        conv_name = _current_log_path.parent.name if _current_log_path else "暂未绑定（等待首条消息）"
+        is_proc_alive = bool(agy_mgr.proc and getattr(agy_mgr.proc, "isalive", lambda: True)())
+        reply = (
+            "📊 **AGY-QQ-Bridge 运行状态**\n\n"
+            f"• **工作区**: `{AGY_WORKSPACE}`\n"
+            f"• **当前会话**: `{conv_name}`\n"
+            f"• **终端状态**: {'运行中' if is_proc_alive else '未就绪'}\n"
+            f"• **管理员**: `{MASTER_OPENID[:8]}...`"
+        )
         await send_message_rest(user_openid, reply)
         return
 
@@ -747,12 +840,32 @@ async def _heartbeat_sender(ws, interval: float):
         logger.debug(f"Heartbeat error: {e}")
 
 
+async def _sync_menu_and_panels():
+    """在后台自动同步 QQ 机器人自定义菜单与指令面板"""
+    try:
+        root_dir = Path(__file__).parent.parent
+        if str(root_dir) not in sys.path:
+            sys.path.insert(0, str(root_dir))
+        from manage_menu_panel import QQMenuPanelManager
+        loop = asyncio.get_running_loop()
+        def _do_sync():
+            mgr = QQMenuPanelManager(APP_ID, CLIENT_SECRET)
+            return mgr.ensure_all_defaults()
+        res = await loop.run_in_executor(None, _do_sync)
+        logger.info(f"QQ 菜单与面板已就绪: 菜单版本 {res.get('menu', {}).get('version')}, C2C面板: {res.get('panel_c2c', {}).get('action')}, 群面板: {res.get('panel_group', {}).get('action')}")
+    except Exception as e:
+        logger.warning(f"自动同步菜单面板跳过/失败: {e}")
+
+
 async def main():
     global _running
     _running = True
 
     # 启动后台异步日志监听服务
     asyncio.create_task(log_listener())
+
+    # 自动同步/注册 QQ 自定义菜单与指令面板
+    asyncio.create_task(_sync_menu_and_panels())
 
     # 首次启动拉起本地保活终端
     agy_mgr.start(fresh=False)

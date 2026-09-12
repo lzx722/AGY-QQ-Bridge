@@ -78,13 +78,48 @@ pm2 logs agy-qq-bridge
 
 ## 💬 交互指令介绍
 
-在 QQ 个人私聊中，您可以向您的机器人发送以下控制指令：
+在 QQ 个人私聊或群聊中，您可以向您的机器人发送以下控制指令：
 
 | 指令 | 作用 | 内部实现逻辑 |
 | :--- | :--- | :--- |
-| **任意文字** | 交互输入 | 发送 Escape 清理终端 TUI 状态 ➔ 通过 tmux 物理键入 ➔ 回车发送给 AGY |
-| **`/new`** | 重置会话 | 强杀旧的 tmux 会话 ➔ 新建 tmux 会话 ➔ 自动拉起全新 AGY 进程 ➔ 桥接器 0.5s 内自动热绑定全新日志 |
-| **`/stop`** | 强行终止 | 连续向 tmux 发送三次 `Ctrl+C` 物理信号，强制停止当前的执行任务，恢复命令行状态 |
+| **`/help`** | 使用帮助 | 返回机器人的快捷指令手册、使用说明及操作指引 |
+| **`/status`** | 运行状态 | 快速查看当前工作区路径、绑定的会话 ID、终端及桥接器存活状态 |
+| **`/new`** | 重置会话 | 强杀旧会话 ➔ 自动拉起全新无上下文 AGY 进程 ➔ 0.5s 内自动热绑定全新日志 |
+| **`/stop`** | 强行终止 | 连续发送 `Ctrl+C` 物理中断信号，强制停止当前的执行任务，恢复提示符状态 |
+| **任意文字** | 交互输入 | 发送 Escape 清理终端 TUI 状态 ➔ 物理模拟键入 ➔ 回车发送给 AGY |
+| **图片/文件** | 多模态解析 | 原生提取 QQ 临时直链，以 `[附件(name): url]` 形式交由 AGY 多模态解析 |
+
+---
+
+## 📱 自定义菜单与指令面板配置
+
+机器人支持两种便捷交互界面（基于 QQ 开放平台官方 OpenAPI）：
+1. **自定义菜单 (Custom Menu)**：位于手机/桌面 QQ **单聊窗口底部常驻菜单栏**，支持点击直接填入指令（如 `/new`、`/stop`）或展开二级折叠菜单。
+2. **指令面板 (Command Panel)**：位于**输入框快捷指令面板**（输入 `/` 或点击面板呼出），支持单聊（C2C）与群聊（Group），展示指令名称与功能介绍。
+
+### 自动化注册与管理工具 (`manage_menu_panel.py`)
+
+* **自动注册**：桥接服务（Windows `agy_qq_bridge_win.py` 与 Linux `bridge.py`）在启动时会自动向 QQ 开放平台注册/同步单聊自定义菜单与指令面板，无需手动配置。
+* **手动管理/查询（可选）**：
+  ```bash
+  # 运行交互式控制台
+  python manage_menu_panel.py
+
+  # 1. 查看当前生效的全局自定义菜单
+  python manage_menu_panel.py --menu-get
+
+  # 2. 一键应用推荐的自定义菜单（包含新对话、停止执行、帮助与状态）
+  python manage_menu_panel.py --menu-set-default
+
+  # 3. 清空自定义菜单
+  python manage_menu_panel.py --menu-clear
+
+  # 4. 查看指令面板列表
+  python manage_menu_panel.py --panel-list c2c
+
+  # 5. 一键创建推荐指令面板 (c2c 或 group)
+  python manage_menu_panel.py --panel-create-default c2c
+  ```
 
 ---
 

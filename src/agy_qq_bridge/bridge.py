@@ -104,6 +104,8 @@ class QQBridge:
         self.last_log_size = 0
         self.current_log_path = None
         self.last_sent_timestamp = ""  # 记录最后发送给 QQ 的消息时间戳，防重与防历史刷屏
+        self.is_busy = False
+        self.last_sent_time = 0.0
 
     def get_http_client(self):
         if self.http_client is None:
@@ -241,6 +243,8 @@ class QQBridge:
 
     async def send_to_agy(self, message: str):
         """发送消息给 tmux 中的 AGY"""
+        self.is_busy = True
+        self.last_sent_time = time.time()
         logger.info(f"[Tmux Target] Sending keys to session: {self.tmux_session}")
         # 模拟按 Escape 强退可能卡在 TUI 或 PAGER 的状态
         proc_esc = await asyncio.create_subprocess_exec(
@@ -382,6 +386,7 @@ class QQBridge:
                         logger.info(f"[Listener -> QQ] Broadcasting response (ts={ts}): {text[:100]}")
                         if ts:
                             self.last_sent_timestamp = ts
+                        self.is_busy = False
                         # 动态路由选择投递渠道
                         target = self.last_message_source
                         if target["type"] == "group":
@@ -391,6 +396,48 @@ class QQBridge:
                             if dest:
                                 await self.send_message_rest(dest, text)
 
+async def get_local_git_status(workspace: Path) -> str:
+    """本地直接执行 git status，毫秒级诊断返回，零 Token 消耗"""
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "git", "-C", str(workspace), "status", "-s",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        stdout, stderr = await proc.communicate()
+        if proc.returncode != 0:
+            err_msg = stderr.decode("utf-8", errors="replace").strip()
+            return f"⚠️ 执行 `git status` 失败: {err_msg}"
+
+        status_text = stdout.decode("utf-8", errors="replace").strip()
+
+        proc_b = await asyncio.create_subprocess_exec(
+            "git", "-C", str(workspace), "branch", "--show-current",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        stdout_b, _ = await proc_b.communicate()
+        branch = stdout_b.decode("utf-8", errors="replace").strip() or "HEAD"
+
+        if not status_text:
+            return f"📁 **Git 工作区状态**\n\n• **工作区**: `{workspace}`\n• **当前分支**: `{branch}`\n\n✅ **工作区很干净，无任何未提交的代码变更。**"
+
+        lines = [l for l in status_text.splitlines() if l.strip()]
+        display_lines = "\n".join(lines[:25])
+        if len(lines) > 25:
+            display_lines += f"\n... (其余 {len(lines) - 25} 项已折叠)"
+
+        return (
+            f"📁 **Git 工作区状态**\n\n"
+            f"• **工作区**: `{workspace}`\n"
+            f"• **当前分支**: `{branch}` ({len(lines)} 项变动)\n\n"
+            f"```text\n{display_lines}\n```\n"
+            f"💡 *提示：若需让 AI 审查或提交代码，可直接输入对话「帮我提交以上变动」*"
+        )
+    except Exception as e:
+        return f"⚠️ 检查工作区失败: {e}"
+
+
     async def handle_c2c_message(self, d: dict):
         msg_id = str(d.get("id", ""))
         if not msg_id or self.is_duplicate(msg_id):
@@ -398,7 +445,7 @@ class QQBridge:
 
         content = str(d.get("content", "")).strip()
 
-        # 提取附件 URL（图片、语音、视频、文件等），零截留原样透传
+        # 提取附件
         attachments = d.get("attachments") or []
         for att in attachments:
             url = att.get("url")
@@ -414,13 +461,12 @@ class QQBridge:
             return
 
         self.last_msg_id = msg_id
-        logger.info(f"[Recv] openid={user_openid}: {content[:100]}")
+        logger.info(f"[C2C Recv] openid={user_openid}: {content[:100]}")
 
-        # 自动绑定：首次收到消息时，将发送者设为 master_openid
+        # 检查并自动绑定 MASTER_OPENID
         if not self.master_openid:
             self.master_openid = user_openid
-            logger.info(f"[Auto-bind] First message from {user_openid} set as master_openid")
-            # 尝试将 MASTER_OPENID 写入 .env，方便用户后续查看
+            logger.info(f"[Auto-bind] First message from {user_openid} set as MASTER_OPENID")
             try:
                 env_path = Path(".env")
                 if env_path.exists():
@@ -430,9 +476,10 @@ class QQBridge:
                             env_text.rstrip() + f"\nMASTER_OPENID={user_openid}\n",
                             encoding="utf-8",
                         )
-            except Exception:
-                pass
+            except Exception as e:
+                logger.error(f"Failed to auto-bind MASTER_OPENID in .env: {e}")
 
+        # 非主人消息直接静默丢弃
         if user_openid != self.master_openid:
             logger.info(f"[Skip] non-master openid: {user_openid}")
             return
@@ -441,7 +488,7 @@ class QQBridge:
         self.last_message_source = {"type": "c2c", "openid": user_openid, "reply_to": None}
 
         # 命令处理
-        if content.strip().lower() in ["/new", "/reset", "/清空", "/新对话"]:
+        if content.strip().lower() in ["/new", "/reset", "/清空", "/新对话", "new", "reset"]:
             logger.info("[Recv] New session command received")
             self.group_chat_buffer.clear()
 
@@ -472,15 +519,54 @@ class QQBridge:
             await self.send_message_rest(user_openid, reply)
             return
 
-        if content.strip().lower() in ["/stop", "/停止", "/kill"]:
+        if content.strip().lower() in ["/stop", "/停止", "/kill", "stop"]:
             logger.info("[Recv] Stop command received")
-            for key in ["C-c", "Enter", "C-c"]:
+            # 智能防护：如果当前没有正在执行的任务（空闲状态），发送 Escape 清理输入状态，绝不发送多次 Ctrl+C 杀退终端
+            if not self.is_busy and (time.time() - self.last_sent_time > 60 or self.last_sent_time == 0):
                 proc = await asyncio.create_subprocess_exec(
-                    "tmux", "send-keys", "-t", f"{self.tmux_session}:", key, ""
+                    "tmux", "send-keys", "-t", f"{self.tmux_session}:", "Escape", ""
                 )
                 await proc.communicate()
-                await asyncio.sleep(0.3)
-            reply = "⛔ 已发送终止信号并尝试恢复命令行。"
+                reply = "ℹ️ 当前终端处于空闲就绪状态，未在执行耗时任务，请放心继续发送新消息。"
+            else:
+                for key in ["C-c", "Escape"]:
+                    proc = await asyncio.create_subprocess_exec(
+                        "tmux", "send-keys", "-t", f"{self.tmux_session}:", key, ""
+                    )
+                    await proc.communicate()
+                    await asyncio.sleep(0.2)
+                self.is_busy = False
+                reply = "⛔ 已向后台发送中断信号（Ctrl+C），正在打断当前任务并恢复就绪状态。"
+            await self.send_message_rest(user_openid, reply)
+            return
+
+        if content.strip().lower() in ["/git", "/git status", "git status", "/git diff"]:
+            logger.info("[Recv] Local git status requested")
+            reply = await get_local_git_status(Path.cwd())
+            await self.send_message_rest(user_openid, reply)
+            return
+
+        if content.strip().lower() in ["/help", "/帮助", "帮助", "help"]:
+            reply = (
+                "🤖 **AGY-QQ-Bridge 控制中心**\n\n"
+                "• `/new` 或 `/清空`：重置后台 tmux 会话，开启全新无上下文会话\n"
+                "• `/stop` 或 `/停止`：向后台发送 Ctrl+C 中断信号终止当前任务\n"
+                "• `/status` 或 `/状态`：查看当前工作区与会话绑定状态\n"
+                "• 直接发送文本：自动输入给后台 Google Antigravity CLI\n"
+                "• 发送图片/文件：原生直链由 AGY 视觉与多模态解析"
+            )
+            await self.send_message_rest(user_openid, reply)
+            return
+
+        if content.strip().lower() in ["/status", "/状态", "status"]:
+            conv_name = self.current_log_path.parent.name if self.current_log_path else "暂未绑定（等待首条消息）"
+            reply = (
+                "📊 **AGY-QQ-Bridge 运行状态**\n\n"
+                f"• **tmux 会话**: `{self.tmux_session}`\n"
+                f"• **当前会话**: `{conv_name}`\n"
+                f"• **启动命令**: `{self.agy_start_cmd}`\n"
+                f"• **管理员**: `{self.master_openid[:8]}...`"
+            )
             await self.send_message_rest(user_openid, reply)
             return
 
@@ -553,7 +639,7 @@ class QQBridge:
         # 判断发送人是否是主人授权执行命令
         is_master = (member_openid == self.master_openid)
 
-        if is_master and clean_content.lower() in ["/new", "/reset", "/清空", "/新对话"]:
+        if is_master and clean_content.lower() in ["/new", "/reset", "/清空", "/新对话", "new", "reset"]:
             logger.info("[Group Recv] Reset command received")
             proc_kill = await asyncio.create_subprocess_shell(f"tmux kill-session -t {self.tmux_session} 2>/dev/null || true")
             await proc_kill.communicate()
@@ -576,15 +662,51 @@ class QQBridge:
             await self.send_group_message_rest(group_openid, reply, reply_to=msg_id)
             return
 
-        if is_master and clean_content.lower() in ["/stop", "/停止", "/kill"]:
+        if is_master and clean_content.lower() in ["/stop", "/停止", "/kill", "stop"]:
             logger.info("[Group Recv] Stop command received")
-            for key in ["C-c", "Enter", "C-c"]:
+            if not self.is_busy and (time.time() - self.last_sent_time > 60 or self.last_sent_time == 0):
                 proc = await asyncio.create_subprocess_exec(
-                    "tmux", "send-keys", "-t", f"{self.tmux_session}:", key, ""
+                    "tmux", "send-keys", "-t", f"{self.tmux_session}:", "Escape", ""
                 )
                 await proc.communicate()
-                await asyncio.sleep(0.3)
-            reply = "⛔ 已发送终止信号并尝试恢复命令行。"
+                reply = "ℹ️ 当前终端处于空闲就绪状态，未在执行耗时任务，请放心继续提问。"
+            else:
+                for key in ["C-c", "Escape"]:
+                    proc = await asyncio.create_subprocess_exec(
+                        "tmux", "send-keys", "-t", f"{self.tmux_session}:", key, ""
+                    )
+                    await proc.communicate()
+                    await asyncio.sleep(0.2)
+                self.is_busy = False
+                reply = "⛔ 已向后台发送中断信号（Ctrl+C），正在打断当前任务并恢复就绪状态。"
+            await self.send_group_message_rest(group_openid, reply, reply_to=msg_id)
+            return
+
+        if clean_content.lower() in ["/git", "/git status", "git status", "/git diff"]:
+            logger.info("[Group Recv] Local git status requested")
+            reply = await get_local_git_status(Path.cwd())
+            await self.send_group_message_rest(group_openid, reply, reply_to=msg_id)
+            return
+
+        if clean_content.lower() in ["/help", "/帮助", "帮助", "help"]:
+            reply = (
+                "🤖 **AGY-QQ-Bridge 群聊指令说明**\n\n"
+                "• `@机器人 /new`：(管理员) 重置会话与群聊讨论缓存\n"
+                "• `@机器人 /stop`：(管理员) 发送中断信号停止当前任务\n"
+                "• `@机器人 /status`：查看当前运行状态与工作区\n"
+                "• `@机器人 [问题]`：将群聊最近上下文与提问汇总送交 AGY CLI"
+            )
+            await self.send_group_message_rest(group_openid, reply, reply_to=msg_id)
+            return
+
+        if clean_content.lower() in ["/status", "/状态", "status"]:
+            conv_name = self.current_log_path.parent.name if self.current_log_path else "暂未绑定"
+            reply = (
+                "📊 **AGY-QQ-Bridge 运行状态**\n\n"
+                f"• **tmux 会话**: `{self.tmux_session}`\n"
+                f"• **当前会话**: `{conv_name}`\n"
+                f"• **群聊缓冲数**: {len(self.group_chat_buffer)} 条"
+            )
             await self.send_group_message_rest(group_openid, reply, reply_to=msg_id)
             return
 
@@ -678,11 +800,30 @@ class QQBridge:
         except Exception as e:
             logger.debug(f"Heartbeat error: {e}")
 
+    async def _sync_menu_and_panels(self):
+        """在后台自动同步 QQ 机器人自定义菜单与指令面板"""
+        try:
+            root_dir = Path(__file__).resolve().parent.parent.parent
+            if str(root_dir) not in sys.path:
+                sys.path.insert(0, str(root_dir))
+            from manage_menu_panel import QQMenuPanelManager
+            loop = asyncio.get_running_loop()
+            def _do_sync():
+                mgr = QQMenuPanelManager(self.app_id, self.client_secret)
+                return mgr.ensure_all_defaults()
+            res = await loop.run_in_executor(None, _do_sync)
+            logger.info(f"QQ 菜单与面板已就绪: 菜单版本 {res.get('menu', {}).get('version')}, C2C面板: {res.get('panel_c2c', {}).get('action')}, 群面板: {res.get('panel_group', {}).get('action')}")
+        except Exception as e:
+            logger.warning(f"自动同步菜单面板跳过/失败: {e}")
+
     async def start(self):
         self.running = True
 
         # 启动后台异步日志监听服务
         asyncio.create_task(self.log_listener())
+
+        # 自动同步/注册 QQ 自定义菜单与指令面板
+        asyncio.create_task(self._sync_menu_and_panels())
 
         try:
             gateway_url = await self.get_gateway_url()
