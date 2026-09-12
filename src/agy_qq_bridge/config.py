@@ -97,6 +97,7 @@ TMUX_SESSION = os.environ.get("TMUX_SESSION", "0")
 def setup_logger(name: str = "agy_qq_bridge") -> logging.Logger:
     """初始化双端（终端标准输出 + 文件记录）日志记录器"""
     logger = logging.getLogger(name)
+    logger.propagate = False
     if not logger.handlers:
         logger.setLevel(logging.INFO)
         formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")

@@ -124,12 +124,27 @@ def parse_history_range(
     if len(args) == 1:
         raw_arg = args[0].strip()
 
+        # 检查是否为小数 / 浮点数 (如 2.5, 0.5, -1.5)
+        if re.match(r"^[+-]?\d+\.\d+$", raw_arg) or re.match(r"^[+-]?\.\d+$", raw_arg):
+            return None, None, f"⚠️ 查询参数必须为正整数，不能包含小数（输入为「{raw_arg}」）。示例：`/history 10`"
+
+        # 检查是否为单负数 (如 -2, -10)
+        if re.match(r"^-\d+$", raw_arg):
+            return None, None, f"⚠️ 查询数量或会话序号不能为负数（输入为「{raw_arg}」）。会话序号从 1 开始，示例：`/history 10`"
+
+        # 检查是否为 0
+        if raw_arg == "0":
+            return None, None, "⚠️ 查询数量必须大于 0（示例：`/history 10`）。会话序号从 1 开始。"
+
         # 格式1: 单参数内含范围 31-40, 31~40, 31..40
-        m_range = re.match(r"^(\d+)[-~.]{1,2}(\d+)$", raw_arg)
+        m_range = re.match(r"^([+-]?\d+(?:\.\d+)?)(?:[-~]{1,2}|\.{2})([+-]?\d+(?:\.\d+)?)$", raw_arg)
         if m_range:
-            n1, n2 = int(m_range.group(1)), int(m_range.group(2))
+            s1, s2 = m_range.group(1), m_range.group(2)
+            if "." in s1 or "." in s2:
+                return None, None, f"⚠️ 范围序号必须为正整数，不能包含小数（输入为「{raw_arg}」）。有效范围示例：`/history 1-10`"
+            n1, n2 = int(s1), int(s2)
             if n1 <= 0 or n2 <= 0:
-                return None, None, "⚠️ 会话序号从 1 开始，不能包含 0 或负数。有效范围示例：`/history 1-10`"
+                return None, None, f"⚠️ 会话序号从 1 开始，不能包含 0 或负数（输入为「{raw_arg}」）。有效范围示例：`/history 1-10`"
             start = min(n1, n2)
             end = max(n1, n2)
             if end - start + 1 > max_page_size:
@@ -137,17 +152,20 @@ def parse_history_range(
             return start, end, None
 
         # 格式2: 单参数页码 p4, page4, 页4
-        m_page = re.match(r"^(?:p|page|页)(\d+)$", raw_arg, re.I)
+        m_page = re.match(r"^(?:p|page|页)([+-]?\d+(?:\.\d+)?)$", raw_arg, re.I)
         if m_page:
-            page = int(m_page.group(1))
+            p_val = m_page.group(1)
+            if "." in p_val:
+                return None, None, f"⚠️ 页码必须为正整数，不能包含小数（输入为「{raw_arg}」）。示例：`/history p1`"
+            page = int(p_val)
             if page <= 0:
-                return None, None, "⚠️ 页码必须大于等于 1（示例：`/history p1`）。"
+                return None, None, f"⚠️ 页码必须大于等于 1（输入为「{raw_arg}」）。示例：`/history p1`"
             page_size = 10
             start = (page - 1) * page_size + 1
             end = start + page_size - 1
             return start, end, None
 
-        # 格式3: 单纯数字，如 /history 10
+        # 格式3: 单纯正整数数字，如 /history 10
         if raw_arg.isdigit():
             val = int(raw_arg)
             if val <= 0:
@@ -167,8 +185,14 @@ def parse_history_range(
     # 双参数情形 len(args) == 2
     arg1, arg2 = args[0].strip(), args[1].strip()
 
+    # 检查双参数是否包含小数
+    if re.match(r"^[+-]?\d+\.\d+$", arg1) or re.match(r"^[+-]?\d+\.\d+$", arg2):
+        return None, None, f"⚠️ 会话查询参数必须为正整数，不能包含小数（输入为「{arg1} {arg2}」）。示例：`/history 1 10` 或 `/history 10 p2`"
+
     # 格式 A: p 4 / page 4 / 页 4
     if arg1.lower() in ["p", "page", "页"]:
+        if re.match(r"^-\d+$", arg2) or arg2 == "0":
+            return None, None, f"⚠️ 页码必须大于等于 1（输入为「{arg2}」）。示例：`/history page 2`"
         if arg2.isdigit():
             page = int(arg2)
             if page <= 0:
@@ -180,6 +204,10 @@ def parse_history_range(
         else:
             return None, None, f"⚠️ 页码「{arg2}」无效，请输入正整数页码（示例：`/history page 2`）。"
 
+    # 检查负数或 0
+    if arg1.startswith("-") or arg2.startswith("-") or arg1 == "0" or arg2 == "0":
+        return None, None, f"⚠️ 会话序号从 1 开始，参数不能包含 0 或负数（输入为「{arg1} {arg2}」）。示例：`/history 1 10`"
+
     # 格式 B: 10 p4 / 31 40
     if arg1.isdigit():
         v1 = int(arg1)
@@ -188,11 +216,14 @@ def parse_history_range(
 
         # 10 p4
         if arg2.lower().startswith(("p", "page", "页")):
-            m_p2 = re.match(r"^(?:p|page|页)(\d+)$", arg2, re.I)
+            m_p2 = re.match(r"^(?:p|page|页)([+-]?\d+(?:\.\d+)?)$", arg2, re.I)
             if m_p2:
-                v2 = int(m_p2.group(1))
+                p_val = m_p2.group(1)
+                if "." in p_val:
+                    return None, None, f"⚠️ 页码必须为正整数，不能包含小数（输入为「{arg2}」）。"
+                v2 = int(p_val)
                 if v2 <= 0:
-                    return None, None, "⚠️ 页码必须大于等于 1。"
+                    return None, None, f"⚠️ 页码必须大于等于 1（输入为「{arg2}」）。"
                 page_size = min(v1, max_page_size)
                 start = (v2 - 1) * page_size + 1
                 end = start + page_size - 1
@@ -219,6 +250,115 @@ def parse_history_range(
         "  - 范围查询：`/history 31 40`\n"
         "  - 分页查询：`/history page 4` 或 `/history 10 p4`"
     )
+
+
+def parse_resume_arg(parts: List[str]) -> Tuple[Optional[int], Optional[str]]:
+    """
+    解析并严格校验 /resume 后的参数。
+    支持格式: 单个正整数编号（如 /resume 1, /resume 5, /resume #1）
+    拦截并友好提示:
+      - 无参数: 提示输入编号
+      - 多参数: 拦截并检测是否误将两数范围或分页当做 resume 参数
+      - 范围参数: 31-40, 31~40, 31..40 -> 指引使用 /history
+      - 分页参数: p4, page 4, 页 4 -> 指引使用 /history
+      - 负数参数: -2, #-2 -> 拦截并明确提示不能为负数
+      - 零参数: 0, #0 -> 拦截并明确提示必须从 1 开始
+      - 小数/浮点参数: 2.5, 0.5, -1.5 -> 拦截并明确提示不能包含小数
+      - 非数字乱码: 拦截并提示输入正整数编号
+    返回: (target_idx, err_msg)
+    """
+    args = parts[1:] if len(parts) > 1 else []
+    if not args:
+        return None, (
+            "ℹ️ **请提供要恢复的会话编号**\n\n"
+            "• 示例：`/resume 1`\n"
+            "• 若尚未查看编号，请先发送 `/history` 获取列表。"
+        )
+
+    if len(args) > 1:
+        combined_args = " ".join(args)
+        if len(args) == 2 and args[0].isdigit() and args[1].isdigit():
+            hint = f"检测到输入为两数范围参数，若要查看该范围列表，请使用：`/history {combined_args}`"
+        elif any(a.lower().startswith(("p", "page", "页")) for a in args):
+            hint = f"检测到输入为分页参数，若要查看该页列表，请使用：`/history {combined_args}`"
+        elif any(re.match(r"^[+-]?\d+(?:\.\d+)?$", a) for a in args):
+            hint = "会话编号必须为单个正整数，不能包含多个数值。"
+        else:
+            hint = "`/resume` 仅接收单个会话编号（示例：`/resume 1`）。"
+        return None, f"⚠️ **参数格式错误**（输入了多余参数「{combined_args}」）。\n\n• {hint}"
+
+    raw_arg = args[0].strip()
+
+    # 1. 检查是否为小数 / 浮点数 (如 2.5, 0.5, -1.5, .5)
+    if re.match(r"^#?[+-]?\d+\.\d+$", raw_arg) or re.match(r"^#?[+-]?\.\d+$", raw_arg):
+        return None, (
+            f"⚠️ 会话编号必须为正整数，不能包含小数（输入为「{raw_arg}」）。\n\n"
+            "• 正确示例：`/resume 1` 或 `/resume 5`"
+        )
+
+    # 2. 检查是否为负数 (如 -2, -1, #-2)
+    if re.match(r"^#?-\d+$", raw_arg):
+        return None, (
+            f"⚠️ 会话编号必须为正整数，不能为负数（输入为「{raw_arg}」）。\n\n"
+            "• 会话序号从 1 开始，正确示例：`/resume 1` 或 `/resume 2`"
+        )
+
+    # 3. 检查是否为 0
+    clean_cand = raw_arg.lstrip("#").strip("[]()")
+    if clean_cand == "0" or re.match(r"^#?0+$", raw_arg):
+        return None, (
+            f"⚠️ 会话编号必须从 1 开始，不能为 0（输入为「{raw_arg}」）。\n\n"
+            "• 正确示例：`/resume 1`"
+        )
+
+    # 4. 检查是否误输入为范围模式 (如 31-40, 31~40, 31..40, 1.5-3.5)
+    m_range = re.match(r"^([+-]?\d+(?:\.\d+)?)(?:[-~]{1,2}|\.{2})([+-]?\d+(?:\.\d+)?)$", raw_arg)
+    if m_range:
+        s1, s2 = m_range.group(1), m_range.group(2)
+        if "." in s1 or "." in s2:
+            return None, (
+                f"⚠️ 检测到范围参数「{raw_arg}」，但会话序号必须为正整数，不能包含小数！\n\n"
+                f"👉 正确范围查询示例：`/history 1-10`"
+            )
+        if s1.startswith("-") or s2.startswith("-") or s1 == "0" or s2 == "0":
+            return None, (
+                f"⚠️ 检测到范围参数「{raw_arg}」，但会话序号必须从 1 开始，不能为负数或 0！\n\n"
+                f"👉 正确范围查询示例：`/history 1-10`"
+            )
+        return None, (
+            f"⚠️ 检测到范围参数「{raw_arg}」！`/resume` 仅支持切换至单个会话编号。\n\n"
+            f"👉 若要查看第 {raw_arg} 项会话列表，请使用：`/history {raw_arg}`\n"
+            f"👉 若要切换具体会话，请输入具体单编号：`/resume <编号>`"
+        )
+
+    # 5. 检查是否误输入为分页模式 (如 p4, page4, 页4, p1.5)
+    m_page = re.match(r"^(?:p|page|页)([+-]?\d+(?:\.\d+)?)$", raw_arg, re.I)
+    if m_page:
+        p_val = m_page.group(1)
+        if "." in p_val:
+            return None, f"⚠️ 页码必须为正整数，不能包含小数（输入为「{raw_arg}」）。示例：`/history p1`"
+        if p_val.startswith("-") or p_val == "0":
+            return None, f"⚠️ 页码必须大于等于 1（输入为「{raw_arg}」）。示例：`/history p1`"
+        return None, (
+            f"⚠️ 检测到页码参数「{raw_arg}」！`/resume` 仅支持切换至单个会话编号。\n\n"
+            f"👉 若要翻页查看历史列表，请使用：`/history {raw_arg}`\n"
+            f"👉 若要切换具体会话，请输入具体单编号：`/resume <编号>`"
+        )
+
+    # 6. 正整数匹配 (如 1, #1, [1])
+    clean_num = raw_arg.lstrip("#").strip("[]()").rstrip(".、")
+    if not clean_num.isdigit():
+        return None, (
+            f"⚠️ 会话编号「{raw_arg}」格式无效，请输入纯正整数编号。\n\n"
+            "• 合法示例：`/resume 1` 或 `/resume 5`\n"
+            "• 若尚未查看编号，请先发送 `/history` 获取列表。"
+        )
+
+    idx = int(clean_num)
+    if idx <= 0:
+        return None, f"⚠️ 会话编号必须从 1 开始（输入为 {idx}）。"
+
+    return idx, None
 
 
 def validate_rename_title(new_title: str) -> Tuple[bool, str]:
@@ -278,7 +418,7 @@ def validate_rename_title(new_title: str) -> Tuple[bool, str]:
         sub = " ".join(parts_t[1:])
         if (
             parts_t[1].isdigit()
-            or re.match(r"^\d+[-~.]{1,2}\d+$", parts_t[1])
+            or re.match(r"^([+-]?\d+(?:\.\d+)?)(?:[-~]{1,2}|\.{2})([+-]?\d+(?:\.\d+)?)$", parts_t[1])
             or re.match(r"^(?:p|page|页)\d*$", parts_t[1], re.I)
         ):
             return False, (
@@ -287,9 +427,33 @@ def validate_rename_title(new_title: str) -> Tuple[bool, str]:
                 f"• 若要重命名当前会话，请输入具体的描述文本（例如：`/rename 优化登录逻辑`）"
             )
 
-    # 4. 检查是否为单编号（纯数字、带#号、括号等，如 1, #1, [1], 12）
-    clean_num = t.lstrip("#-").strip("[]()").rstrip(".、")
-    if clean_num.isdigit():
+    # 4. 检查是否为负数单编号 (如 -2, -1, #-2)
+    if re.match(r"^#?-\d+$", t):
+        return False, (
+            f"⚠️ 检测到参数「{t}」为负数编号，不能作为会话主题！\n\n"
+            "• 会话序号必须从 1 开始，不能为负数。\n"
+            "• 若您想重命名当前会话，请输入具体的描述文本（例如：`/rename 优化登录逻辑`）"
+        )
+
+    # 4.1 检查是否为 0
+    if re.match(r"^#?0+$", t) or t.lstrip("#").strip("[]()") == "0":
+        return False, (
+            f"⚠️ 检测到参数「{t}」为 0，不能作为会话主题！\n\n"
+            "• 会话序号必须从 1 开始，不能为 0。\n"
+            "• 若您想重命名当前会话，请输入具体的描述文本（例如：`/rename 优化登录逻辑`）"
+        )
+
+    # 4.2 检查是否为小数 / 浮点数 (如 2.5, -2.5, 0.5, .5)
+    if re.match(r"^#?[+-]?(?:\d+\.\d+|\.\d+|\d+\.)$", t):
+        return False, (
+            f"⚠️ 检测到参数「{t}」为纯小数数值，不能作为会话主题！\n\n"
+            "• 会话序号必须为正整数，不能包含小数。\n"
+            "• 若您想重命名当前会话，请输入具体的描述文本（例如：`/rename 优化登录逻辑`）"
+        )
+
+    # 4.3 检查是否为单正整数编号（纯数字、带#号、括号等，如 1, #1, [1], 12）
+    clean_num = t.lstrip("#").strip("[]()").rstrip(".、")
+    if clean_num.isdigit() and int(clean_num) > 0:
         return False, (
             f"⚠️ 检测到参数「{t}」为纯数字编号，不能作为会话主题！\n\n"
             f"• 若您想切换至该会话，请使用：`/resume {clean_num}`\n"
@@ -298,29 +462,29 @@ def validate_rename_title(new_title: str) -> Tuple[bool, str]:
         )
 
     # 5. 检查是否为 history 范围参数（如 31-40, 31~40, 31..40 或两数 31 40）
-    m_range = re.match(r"^(\d+)[-~.]{1,2}(\d+)$", t)
+    m_range = re.match(r"^([+-]?\d+(?:\.\d+)?)(?:[-~]{1,2}|\.{2})([+-]?\d+(?:\.\d+)?)$", t)
     if m_range:
         return False, (
             f"⚠️ 检测到范围参数「{t}」，疑似想要查看历史会话！\n\n"
-            f"👉 若要查看第 {t} 项会话列表，请使用：`/history {t}`\n"
+            f"👉 若要查看会话列表，请使用：`/history {t}`\n"
             f"• 若要重命名当前会话，请输入具体的描述文本（例如：`/rename 优化登录逻辑`）"
         )
-    if len(parts_t) == 2 and parts_t[0].isdigit() and parts_t[1].isdigit():
+    if len(parts_t) == 2 and re.match(r"^[+-]?\d+(?:\.\d+)?$", parts_t[0]) and re.match(r"^[+-]?\d+(?:\.\d+)?$", parts_t[1]):
         return False, (
             f"⚠️ 检测到两数范围参数「{t}」，疑似想要查看历史会话！\n\n"
-            f"👉 若要查看第 {t} 项会话列表，请使用：`/history {t}`\n"
+            f"👉 若要查看会话列表，请使用：`/history {t}`\n"
             f"• 若要重命名当前会话，请输入具体的描述文本（例如：`/rename 优化登录逻辑`）"
         )
 
     # 6. 检查是否为 history 分页参数（如 p4, page 4, 页 4, 10 p4, 10 page 4）
-    if re.match(r"^(?:p|page|页)\s*\d+$", t, re.I):
+    if re.match(r"^(?:p|page|页)\s*[+-]?\d+(?:\.\d+)?$", t, re.I):
         return False, (
             f"⚠️ 检测到页码参数「{t}」，疑似想要翻页查看历史会话！\n\n"
             f"👉 若要查看该页会话列表，请使用：`/history {t}`\n"
             f"• 若要重命名当前会话，请输入具体的描述文本（例如：`/rename 优化登录逻辑`）"
         )
-    if (len(parts_t) == 2 and parts_t[0].isdigit() and re.match(r"^(?:p|page|页)\d+$", parts_t[1], re.I)) or \
-       (len(parts_t) == 3 and parts_t[0].isdigit() and parts_t[1].lower() in ["p", "page", "页"] and parts_t[2].isdigit()):
+    if (len(parts_t) == 2 and parts_t[0].isdigit() and re.match(r"^(?:p|page|页)[+-]?\d+(?:\.\d+)?$", parts_t[1], re.I)) or \
+       (len(parts_t) == 3 and parts_t[0].isdigit() and parts_t[1].lower() in ["p", "page", "页"] and re.match(r"^[+-]?\d+(?:\.\d+)?$", parts_t[2])):
         return False, (
             f"⚠️ 检测到分页参数「{t}」，疑似想要翻页查看历史会话！\n\n"
             f"👉 若要查看该页会话列表，请使用：`/history {t}`\n"
@@ -331,8 +495,8 @@ def validate_rename_title(new_title: str) -> Tuple[bool, str]:
     uuid_pattern = r"^[0-9a-fA-F]{8}-?[0-9a-fA-F]{4}-?[0-9a-fA-F]{4}-?[0-9a-fA-F]{4}-?[0-9a-fA-F]{12}$"
     if re.match(uuid_pattern, t):
         return False, (
-            f"⚠️ 检测到参数为内部会话 UUID，不能作为会话主题！\n\n"
-            f"• 如需修改会话主题，请输入易于识别的文本（例如：`/rename 项目代码重构`）"
+            "⚠️ 检测到参数为内部会话 UUID，不能作为会话主题！\n\n"
+            "• 如需修改会话主题，请输入易于识别的文本（例如：`/rename 项目代码重构`）"
         )
 
     # 8. 长度限制

@@ -12,6 +12,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 from agy_qq_bridge.session_manager import (
     validate_rename_title,
     parse_history_range,
+    parse_resume_arg,
     shorten_workspace,
     SessionHistoryTracker,
 )
@@ -51,6 +52,25 @@ def test_validate_rename_title():
         ok, err = validate_rename_title(num)
         assert not ok, f"Expected '{num}' to be rejected"
 
+    # 非法输入：负数（禁止被错误识别为 resume 2）
+    for neg in ["-2", "-10", "#-2"]:
+        ok, err = validate_rename_title(neg)
+        assert not ok, f"Expected negative '{neg}' to be rejected"
+        assert "负数" in err, f"Expected error to mention 负数, got: {err}"
+        assert "/resume 2" not in err, f"Should NOT suggest resume 2 for negative {neg}"
+
+    # 非法输入：0
+    for zero in ["0", "#0", "[0]"]:
+        ok, err = validate_rename_title(zero)
+        assert not ok, f"Expected zero '{zero}' to be rejected"
+        assert "0" in err, f"Expected error to mention 0, got: {err}"
+
+    # 非法输入：小数 / 浮点数
+    for dec in ["2.5", "0.5", "-1.5", "1.0", ".5", "#2.5"]:
+        ok, err = validate_rename_title(dec)
+        assert not ok, f"Expected decimal '{dec}' to be rejected"
+        assert "小数" in err, f"Expected error to mention 小数, got: {err}"
+
     # 非法输入：范围参数
     for r in ["31-40", "31~40", "31..40", "31 40"]:
         ok, err = validate_rename_title(r)
@@ -64,8 +84,16 @@ def test_validate_rename_title():
     # 非法输入：UUID
     uuid_str = "0ef404f5-1934-460a-aaca-c41dfe2993db"
     ok, err = validate_rename_title(uuid_str)
-    assert not ok, f"Expected UUID to be rejected"
+    assert not ok, "Expected UUID to be rejected"
 
+    print("  -> Passed!")
+
+
+def test_shorten_workspace():
+    print("[Test] shorten_workspace...")
+    assert shorten_workspace("") == "默认"
+    assert shorten_workspace(str(Path.home())) == "~"
+    assert shorten_workspace("E:/Git/AGY-QQ-Bridge") in ["AGY-QQ-Bridge", "E:\\Git\\AGY-QQ-Bridge", "E:/Git/AGY-QQ-Bridge"]
     print("  -> Passed!")
 
 
@@ -105,15 +133,108 @@ def test_parse_history_range():
     s, e, err = parse_history_range(["/history", "page", "4"], total)
     assert (s, e, err) == (31, 40, None), f"Got {(s, e, err)}"
 
-    # 异常格式报错
+    # 异常格式报错：0、负数与小数
     s, e, err = parse_history_range(["/history", "0"], total)
-    assert err is not None, "Expected error on 0"
+    assert err is not None and "大于 0" in err, f"Expected 0 error, got: {err}"
 
     s, e, err = parse_history_range(["/history", "-5"], total)
-    assert err is not None, "Expected error on negative"
+    assert err is not None and "负数" in err, f"Expected negative error, got: {err}"
+
+    s, e, err = parse_history_range(["/history", "2.5"], total)
+    assert err is not None and "小数" in err, f"Expected decimal error, got: {err}"
+
+    s, e, err = parse_history_range(["/history", "1.5-3.5"], total)
+    assert err is not None and "小数" in err, f"Expected decimal range error, got: {err}"
+
+    s, e, err = parse_history_range(["/history", "-1-5"], total)
+    assert err is not None and ("负数" in err or "1 开始" in err), f"Expected negative range error, got: {err}"
+
+    s, e, err = parse_history_range(["/history", "0-5"], total)
+    assert err is not None and ("0" in err or "1 开始" in err), f"Expected zero range error, got: {err}"
+
+    s, e, err = parse_history_range(["/history", "1.5", "3.5"], total)
+    assert err is not None and "小数" in err, f"Expected decimal error, got: {err}"
+
+    s, e, err = parse_history_range(["/history", "-1", "5"], total)
+    assert err is not None and ("负数" in err or "1 开始" in err), f"Expected negative error, got: {err}"
+
+    s, e, err = parse_history_range(["/history", "0", "5"], total)
+    assert err is not None and ("0" in err or "1 开始" in err), f"Expected zero error, got: {err}"
+
+    s, e, err = parse_history_range(["/history", "p2.5"], total)
+    assert err is not None and "小数" in err, f"Expected decimal error, got: {err}"
+
+    s, e, err = parse_history_range(["/history", "page", "-2"], total)
+    assert err is not None and "大于等于 1" in err, f"Expected page error, got: {err}"
 
     s, e, err = parse_history_range(["/history", "abc"], total)
     assert err is not None, "Expected error on abc"
+
+    print("  -> Passed!")
+
+
+def test_parse_resume_arg():
+    print("[Test] parse_resume_arg...")
+    # 合法单正整数输入
+    idx, err = parse_resume_arg(["/resume", "1"])
+    assert (idx, err) == (1, None), f"Got {(idx, err)}"
+
+    idx, err = parse_resume_arg(["/resume", "#2"])
+    assert (idx, err) == (2, None), f"Got {(idx, err)}"
+
+    idx, err = parse_resume_arg(["/切换", "15"])
+    assert (idx, err) == (15, None), f"Got {(idx, err)}"
+
+    idx, err = parse_resume_arg(["/resume", "[3]"])
+    assert (idx, err) == (3, None), f"Got {(idx, err)}"
+
+    # 无参数
+    idx, err = parse_resume_arg(["/resume"])
+    assert idx is None and "请提供要恢复的会话编号" in err
+
+    # 负数参数拦截（核心防护：绝不能误解析为正数）
+    for neg in ["-2", "#-2", "-10"]:
+        idx, err = parse_resume_arg(["/resume", neg])
+        assert idx is None, f"Expected negative '{neg}' to be rejected"
+        assert "负数" in err, f"Expected error to mention 负数, got: {err}"
+        assert idx != 2, "Negative number must NOT be stripped to 2!"
+
+    # 0 拦截
+    for zero in ["0", "#0", "[0]"]:
+        idx, err = parse_resume_arg(["/resume", zero])
+        assert idx is None, f"Expected zero '{zero}' to be rejected"
+        assert "1 开始" in err or "0" in err, f"Expected error to mention 1 开始, got: {err}"
+
+    # 小数 / 浮点数拦截
+    for dec in ["2.5", "0.5", "-1.5", "#2.5"]:
+        idx, err = parse_resume_arg(["/resume", dec])
+        assert idx is None, f"Expected decimal '{dec}' to be rejected"
+        assert "小数" in err, f"Expected error to mention 小数, got: {err}"
+
+    # 多参数及两数范围拦截
+    idx, err = parse_resume_arg(["/resume", "1", "2"])
+    assert idx is None and "两数范围" in err
+
+    idx, err = parse_resume_arg(["/resume", "page", "4"])
+    assert idx is None and "分页参数" in err
+
+    # 连字符范围拦截及引导
+    idx, err = parse_resume_arg(["/resume", "31-40"])
+    assert idx is None and "/history 31-40" in err
+
+    idx, err = parse_resume_arg(["/resume", "1.5-3.5"])
+    assert idx is None and "小数" in err
+
+    # 分页拦截及引导
+    idx, err = parse_resume_arg(["/resume", "p4"])
+    assert idx is None and "/history p4" in err
+
+    idx, err = parse_resume_arg(["/resume", "p1.5"])
+    assert idx is None and "小数" in err
+
+    # 非法字符串
+    idx, err = parse_resume_arg(["/resume", "abc"])
+    assert idx is None and "格式无效" in err
 
     print("  -> Passed!")
 
@@ -195,10 +316,83 @@ def test_bridge_instantiation():
     print("  -> Passed!")
 
 
+def test_bridge_resume_command():
+    print("[Test] BridgeApp /resume command execution...")
+    import asyncio
+    sent_replies = []
+
+    class MockQQClient:
+        def __init__(self):
+            self.bot_openid = "bot_1"
+            self.master_openid = "test_user"
+
+        def is_duplicate(self, msg_id):
+            return False
+
+        async def send_c2c_message(self, openid, content):
+            sent_replies.append(content)
+            return True
+
+    tmux_mgr = TmuxTerminalManager(session_name="dummy_0")
+    app = BridgeApp(terminal_manager=tmux_mgr, master_openid="test_user", app_id="test_id", client_secret="test_sec")
+    app.qq_client = MockQQClient()
+
+    # 模拟用户发送 /resume 2，确保不会触发 NameError: name 're' is not defined
+    async def run_test():
+        await app.handle_c2c_message({
+            "id": "msg_test_1",
+            "content": "/resume 2",
+            "author": {"user_openid": "test_user"}
+        })
+
+    asyncio.run(run_test())
+    assert len(sent_replies) == 1
+    # 此时因为没有先查 history，会提示请先发送 /history
+    assert "尚未查询过历史会话列表" in sent_replies[0] or "未找到" in sent_replies[0]
+    print("  -> Passed!")
+
+
+def test_menu_panel_defaults():
+    print("[Test] menu_panel default configurations...")
+    from agy_qq_bridge.menu_panel import (
+        DEFAULT_CUSTOM_MENU,
+        DEFAULT_C2C_PANEL,
+        DEFAULT_GROUP_PANEL,
+        _make_headers,
+    )
+
+    # 1. 验证菜单格式与长度约束
+    menu_items = DEFAULT_CUSTOM_MENU.get("menu", {}).get("items", [])
+    assert len(menu_items) > 0
+    for item in menu_items:
+        if item.get("type") == "menu":
+            sub_items = item.get("sub_menu_items", [])
+            assert len(sub_items) <= 5, "QQ开放平台约束：二级菜单最多 5 项"
+            for sub in sub_items:
+                assert len(sub.get("name", "")) <= 14, "QQ开放平台约束：二级菜单名称 <= 14 字符"
+
+    # 2. 验证面板格式与长度约束 (严防 40030013 超出数量限制)
+    for p_cfg in [DEFAULT_C2C_PANEL, DEFAULT_GROUP_PANEL]:
+        items = p_cfg.get("panel", {}).get("items", [])
+        assert len(items) <= 20, "QQ开放平台约束：面板项 <= 20"
+        for item in items:
+            desc = item.get("desc", "")
+            assert len(desc) <= 15, f"QQ开放平台严重约束：desc '{desc}' 超过 15 字符会导致 40030013 错误！"
+
+    # 3. 验证鉴权请求头格式
+    headers = _make_headers("dummy_token")
+    assert headers["Authorization"] == "QQBot dummy_token"
+    print("  -> Passed!")
+
+
 if __name__ == "__main__":
     test_validate_rename_title()
+    test_shorten_workspace()
     test_parse_history_range()
+    test_parse_resume_arg()
     test_session_history_tracker()
     test_terminal_factory()
     test_bridge_instantiation()
+    test_bridge_resume_command()
+    test_menu_panel_defaults()
     print("\n[SUCCESS] ALL TESTS PASSED SUCCESSFULLY!")

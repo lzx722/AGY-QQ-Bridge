@@ -2,7 +2,6 @@
 Windows 平台 ConPTY 虚拟终端管理器
 通过 pywinpty 的 PtyProcess 实现原生 ConPTY 桥接、终端握手自动应答与进程自愈
 """
-import sys
 import time
 import shlex
 import asyncio

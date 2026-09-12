@@ -22,6 +22,7 @@ from .session_manager import (
     parse_timestamp,
     shorten_workspace,
     parse_history_range,
+    parse_resume_arg,
     validate_rename_title,
     get_conversation_title,
     rename_conversation,
@@ -214,58 +215,11 @@ class BridgeApp:
         # 3. /resume
         if cmd in ["/resume", "/切换", "/switch", "resume"]:
             logger.info(f"[Recv] 收到恢复会话请求: {content}")
-            args = parts[1:] if len(parts) > 1 else []
-            if not args:
-                reply = (
-                    "ℹ️ **请提供要恢复的会话编号**\n\n"
-                    "• 示例：`/resume 1`\n"
-                    "• 若尚未查看编号，请先发送 `/history` 获取列表。"
-                )
-                await self.qq_client.send_c2c_message(user_openid, reply)
+            target_idx, err_msg = parse_resume_arg(parts)
+            if err_msg:
+                await self.qq_client.send_c2c_message(user_openid, err_msg)
                 return
 
-            if len(args) > 1:
-                combined_args = " ".join(args)
-                if len(args) == 2 and args[0].isdigit() and args[1].isdigit():
-                    hint = f"检测到输入为范围参数，若要查看该范围列表，请使用：`/history {combined_args}`"
-                elif any(a.lower().startswith(("p", "page", "页")) for a in args):
-                    hint = f"检测到输入为分页参数，若要查看该页列表，请使用：`/history {combined_args}`"
-                else:
-                    hint = f"`/resume` 仅接收单个会话编号（示例：`/resume 1`）。"
-                reply = f"⚠️ **参数格式错误**（输入了多余参数「{combined_args}」）。\n\n• {hint}"
-                await self.qq_client.send_c2c_message(user_openid, reply)
-                return
-
-            raw_arg = args[0].strip()
-            if re.match(r"^\d+[-~.]{1,2}\d+$", raw_arg):
-                reply = (
-                    f"⚠️ 检测到范围参数「{raw_arg}」！`/resume` 仅支持切换至单个会话编号。\n\n"
-                    f"👉 若要查看第 {raw_arg} 项会话列表，请使用：`/history {raw_arg}`\n"
-                    f"👉 若要切换具体会话，请输入具体的单编号：`/resume <编号>`"
-                )
-                await self.qq_client.send_c2c_message(user_openid, reply)
-                return
-
-            if re.match(r"^(?:p|page|页)\d+$", raw_arg, re.I):
-                reply = (
-                    f"⚠️ 检测到页码参数「{raw_arg}」！`/resume` 仅支持切换至单个会话编号。\n\n"
-                    f"👉 若要翻页查看历史列表，请使用：`/history {raw_arg}`\n"
-                    f"👉 若要切换具体会话，请输入具体的单编号：`/resume <编号>`"
-                )
-                await self.qq_client.send_c2c_message(user_openid, reply)
-                return
-
-            clean_arg = raw_arg.lstrip("#-").strip("[]()").rstrip(".、")
-            if not clean_arg.isdigit():
-                reply = (
-                    f"⚠️ 会话编号「{raw_arg}」格式无效，请输入纯正整数编号。\n\n"
-                    "• 合法示例：`/resume 1` 或 `/resume 5`\n"
-                    "• 若尚未查看编号，请先发送 `/history` 获取列表。"
-                )
-                await self.qq_client.send_c2c_message(user_openid, reply)
-                return
-
-            target_idx = int(clean_arg)
             allowed, err_msg, target_item = self.history_tracker.can_resume(target_idx)
             if not allowed or not target_item:
                 await self.qq_client.send_c2c_message(user_openid, err_msg or "⚠️ 无法切换至该会话")
@@ -505,17 +459,15 @@ class BridgeApp:
                 ws_short = shorten_workspace(item["workspace"])
                 title = item["final_title"].replace("\n", " ")[:32]
                 lines.append(f"**[{idx}]** 💬 {title}\n📁 `{ws_short}` | 🕒 {time_str}\n")
-            lines.append(f"👉 恢复会话：90 秒内输入 `@机器人 /resume <编号>`。")
+            lines.append("👉 恢复会话：90 秒内输入 `@机器人 /resume <编号>`。")
             await self.qq_client.send_group_message(group_openid, "\n".join(lines), reply_to=msg_id)
             return
 
         if is_master and g_cmd in ["/resume", "/切换", "/switch", "resume"]:
-            args = g_parts[1:] if len(g_parts) > 1 else []
-            if not args or not args[0].isdigit():
-                await self.qq_client.send_group_message(group_openid, "ℹ️ 请输入单个有效会话编号（示例：`@机器人 /resume 1`）。", reply_to=msg_id)
+            target_idx, err_msg = parse_resume_arg(g_parts)
+            if err_msg:
+                await self.qq_client.send_group_message(group_openid, err_msg, reply_to=msg_id)
                 return
-
-            target_idx = int(args[0])
             allowed, err_msg, target_item = self.history_tracker.can_resume(target_idx)
             if not allowed or not target_item:
                 await self.qq_client.send_group_message(group_openid, err_msg or "⚠️ 无法切换", reply_to=msg_id)

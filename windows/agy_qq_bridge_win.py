@@ -1,7 +1,7 @@
 """
 agy_qq_bridge_win.py — Windows 原生 ConPTY 桥接启动入口
 通过 pywinpty 驱动 Windows 伪控制台，直连 QQ 开放平台 WebSocket 网关
-向后完全兼容 启动机器人.bat 与独立脚本调用
+向后完全兼容 A启动机器人.bat 与独立脚本调用
 """
 import sys
 import socket
@@ -25,6 +25,7 @@ from agy_qq_bridge.session_manager import (
     parse_timestamp,
     shorten_workspace,
     parse_history_range,
+    parse_resume_arg,
     validate_rename_title,
     get_conversation_title,
     rename_conversation,
@@ -38,8 +39,27 @@ from agy_qq_bridge.bridge import BridgeApp
 
 logger = setup_logger("agy_qq_bridge_win")
 
-# 向后兼容类名与实例
+# 向后兼容类名与函数导出
 AgyProcessManager = WinptyTerminalManager
+
+__all__ = [
+    "AgyProcessManager",
+    "WinptyTerminalManager",
+    "BridgeApp",
+    "parse_timestamp",
+    "shorten_workspace",
+    "parse_history_range",
+    "parse_resume_arg",
+    "validate_rename_title",
+    "get_conversation_title",
+    "rename_conversation",
+    "get_history_conversations",
+    "get_workspace_conv_id",
+    "transcript_has_prompt",
+    "get_local_git_status",
+    "acquire_single_instance_lock",
+    "main",
+]
 
 _lock_socket = None
 

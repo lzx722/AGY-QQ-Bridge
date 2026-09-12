@@ -63,8 +63,7 @@ AGY-QQ-Bridge/
 ├── .env.example               # 环境变量配置模板
 ├── agy-qq-bridge.py           # 向后兼容启动入口（Linux / 通用）
 ├── agy-conversation-monitor.py# 本地与 QQ 双通道日志监控工具
-├── 启动机器人.bat              # Windows 一键启动脚本
-├── manage_menu_panel.py       # QQ 开放平台自定义菜单与指令面板管理工具
+├── A启动机器人.bat            # Windows 一键启动脚本
 ├── tests/                     # 自动化测试套件
 │   └── test_refactor.py       # 模块重构与核心交互指令单元测试
 ├── src/
@@ -74,6 +73,7 @@ AGY-QQ-Bridge/
 │       ├── config.py          # 环境与配置中心（.env加载、网络常量、路径与DNS修复）
 │       ├── diagnostics.py     # 零 Token 消耗的本地 Git 与工作区秒级诊断
 │       ├── session_manager.py # 会话生命周期（历史检视、Triple Persistence重命名、90s/3次跳转）
+│       ├── menu_panel.py      # QQ 开放平台自定义菜单与指令面板原生异步管理
 │       ├── terminal/          # 虚拟终端抽象层
 │       │   ├── __init__.py    # 自适应终端工厂函数 create_terminal_manager()
 │       │   ├── base.py        # BaseTerminalManager 虚拟终端抽象基类
@@ -219,9 +219,9 @@ EXCLUDE_CONV_IDS=                                               # 排除的会�
 
 ---
 
-### 6.2 QQ 开放平台自定义菜单与指令面板生态集成 ([manage_menu_panel.py](file:///E:/Git/AGY-QQ-Bridge/manage_menu_panel.py))
+### 6.2 QQ 开放平台自定义菜单与指令面板生态集成 ([menu_panel.py](file:///E:/Git/AGY-QQ-Bridge/src/agy_qq_bridge/menu_panel.py))
 
-本项目集成了 QQ 开放平台官方的交互式入口能力，桥接服务启动时会通过后台协程 `_sync_menu_and_panels()` 自动部署与维护：
+本项目集成了 QQ 开放平台官方的交互式入口能力，桥接服务启动时会通过后台协程 `qq_client.sync_menu_and_panels()` 自动部署与维护（原生异步实现位于 `src/agy_qq_bridge/menu_panel.py`）：
 
 1. **C2C 底部自定义菜单 (`/v2/menu`)**：
    - 仅对私聊用户生效，常驻于手机 QQ 键盘底部。

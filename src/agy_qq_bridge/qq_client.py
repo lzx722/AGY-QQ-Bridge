@@ -7,7 +7,6 @@ import time
 import uuid
 import json
 import asyncio
-from pathlib import Path
 from typing import Optional, Dict, Any, Callable, Awaitable
 
 import httpx
@@ -182,18 +181,10 @@ class QQClient:
     async def sync_menu_and_panels(self) -> None:
         """在后台自动同步 QQ 自定义菜单与指令面板"""
         try:
-            root_dir = Path(__file__).resolve().parent.parent.parent
-            if str(root_dir) not in sys.path:
-                sys.path.insert(0, str(root_dir))
-            from manage_menu_panel import QQMenuPanelManager
-
-            loop = asyncio.get_running_loop()
-
-            def _do_sync():
-                mgr = QQMenuPanelManager(self.app_id, self.client_secret)
-                return mgr.ensure_all_defaults()
-
-            res = await loop.run_in_executor(None, _do_sync)
+            from .menu_panel import sync_defaults
+            token = await self.ensure_token()
+            client = self.get_http_client()
+            res = await sync_defaults(client, token, api_base=self.api_base)
             logger.info(
                 f"[QQ Client] 菜单与面板同步完毕: 菜单版本 {res.get('menu', {}).get('version')}, "
                 f"C2C面板: {res.get('panel_c2c', {}).get('action')}, 群面板: {res.get('panel_group', {}).get('action')}"

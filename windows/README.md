@@ -34,20 +34,21 @@ APP_ID=你的QQ机器人AppID
 CLIENT_SECRET=你的QQ机器人密钥
 MASTER_OPENID=你的管理员OpenID（留空时首次私聊会自动绑定）
 AGY_START_CMD=C:\Users\Administrator\AppData\Local\agy\bin\agy.exe --dangerously-skip-permissions
+AGY_WORKSPACE=C:\Users\Administrator\.agy-qq-bridge\workspace   # 机器人独立工作区（推荐设置）
 BRAIN_DIR=C:\Users\Administrator\.gemini\antigravity-cli\brain
 LOG_DIR=C:\Users\Administrator\.agy-qq-bridge
 ```
 
 ### 3. 一键启动
 
-*   **快捷启动**：直接双击项目根目录下的 **`启动机器人.bat`** 即可。
+*   **快捷启动**：直接双击项目根目录下的 **`A启动机器人.bat`** 即可。
 *   **命令行启动**：
     ```powershell
     cd windows
     python agy_qq_bridge_win.py
     ```
 *   **开机后台自启（可选）**：
-    推荐使用 `NSSM` 或 Windows 任务计划程序将 `启动机器人.bat` 或 `agy_qq_bridge_win.py` 包装为标准的系统后台服务。
+    推荐使用 `NSSM` 或 Windows 任务计划程序将 `A启动机器人.bat` 或 `agy_qq_bridge_win.py` 包装为标准的系统后台服务。
 
 ---
 
