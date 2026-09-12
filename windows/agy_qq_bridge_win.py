@@ -14,7 +14,15 @@ import logging
 import glob
 from typing import Optional, Dict, Any
 from pathlib import Path
-from winpty import PTY  # Windows 运行环境依赖：pip install pywinpty
+from winpty import PtyProcess  # Windows 运行环境依赖：pip install pywinpty
+import aiohttp
+import aiohttp.connector
+import aiohttp.resolver
+try:
+    aiohttp.connector.DefaultResolver = aiohttp.resolver.ThreadedResolver
+    aiohttp.connector.AsyncResolver = aiohttp.resolver.ThreadedResolver
+except Exception:
+    pass
 
 # ================= 环境与配置加载 =================
 def load_env(env_path: str = ".env"):
@@ -56,9 +64,19 @@ HEARTBEAT_INTERVAL = 15.0
 
 # 路径与启动配置
 USER_PROFILE = os.environ.get("USERPROFILE", str(Path.home()))
-BRAIN_DIR = Path(os.environ.get("BRAIN_DIR", str(Path(USER_PROFILE) / ".gemini/antigravity-cli/brain")))
+CLI_HOME = Path(os.environ.get("CLI_HOME", str(Path(USER_PROFILE) / ".gemini" / "antigravity-cli")))
+BRAIN_DIR = Path(os.environ.get("BRAIN_DIR", str(CLI_HOME / "brain")))
 LOG_DIR = Path(os.environ.get("LOG_DIR", str(Path(USER_PROFILE) / ".agy-qq-bridge")))
 AGY_CMD = os.environ.get("AGY_START_CMD", "C:\\Users\\Administrator\\AppData\\Local\\agy\\bin\\agy.exe --dangerously-skip-permissions")
+AGY_WORKSPACE = Path(os.environ.get("AGY_WORKSPACE", USER_PROFILE)).resolve()
+
+# 会话绑定与过滤策略（可通过 .env 配置）
+TARGET_CONV_ID = os.environ.get("TARGET_CONV_ID", "").strip()
+EXCLUDE_CONV_IDS = set(
+    cid.strip() for cid in os.environ.get("EXCLUDE_CONV_IDS", "").split(",") if cid.strip()
+)
+LAST_CONV_FILE = CLI_HOME / "cache" / "last_conversations.json"
+HISTORY_FILE = CLI_HOME / "history.jsonl"
 # ==========================================
 
 os.makedirs(LOG_DIR, exist_ok=True)
@@ -90,157 +108,283 @@ _current_log_path = None
 _last_sent_timestamp = ""  # 记录最后发送给 QQ 的消息时间戳
 _last_heartbeat_ack_time = 0.0  # 记录最后一次收到心跳确认的时间
 
+import shlex
+
 # ================= Process Manager (ConPTY) =================
 class AgyProcessManager:
     def __init__(self):
-        self.pty = None
+        self.proc = None
         self.write_lock = asyncio.Lock()
         self.loop = None
+        self.needs_rebind = False
+        self.fresh_time = 0.0
+        self.last_sent_prompt = ""
+        self.last_sent_time = 0.0
 
     def start(self, fresh=False):
         """在后台虚拟终端中拉起并常驻运行 AGY CLI"""
+        global _current_log_path, _last_sent_timestamp, _last_log_size
         self.loop = asyncio.get_running_loop()
+        self.needs_rebind = True
+        if fresh:
+            self.fresh_time = time.time()
+            self.last_sent_prompt = ""
+            _current_log_path = None
+            _last_sent_timestamp = ""
+            _last_log_size = 0
+        else:
+            self.fresh_time = 0.0
         
         # 如果已有运行的终端，先杀掉重置
-        if self.pty:
+        if self.proc:
             self.terminate()
             
         logger.info("[AGY Run] 正在 Windows ConPTY 中启动常驻 AI 进程...")
         try:
-            # 开启一个 80列x24行的 Windows 虚拟控制台
-            self.pty = PTY(80, 24)
-            # 在 PTY 内部拉起命令提示符
-            self.pty.spawn("cmd.exe")
+            cmd_parts = [p.strip('"\'') for p in shlex.split(AGY_CMD, posix=False)]
+            if not fresh:
+                cmd_parts.append("-c")
+
+            logger.info(f"[AGY Run] 启动命令: {cmd_parts} (工作区: {AGY_WORKSPACE})")
+            self.proc = PtyProcess.spawn(cmd_parts, cwd=str(AGY_WORKSPACE), dimensions=(40, 160))
             
-            # 执行命令逻辑（默认续接，若 fresh=True 则重置会话不加 -c）
-            cmd = f"{AGY_CMD} -c\r\n"
-            if fresh:
-                cmd = f"{AGY_CMD}\r\n"
-                
-            self.pty.write(cmd)
-            
-            # 启动后台异步读取，清空 PTY 缓冲区以防进程挂起
+            # 启动后台异步读取，清空 PTY 缓冲区并自动应答 TUI 设备属性探测
             asyncio.create_task(self._pty_stdout_drainer())
-            logger.info("[AGY Run] AI 进程拉起成功，已在后台保持常驻。")
+            logger.info(f"[AGY Run] AI 进程 (PID={self.proc.pid}) 拉起成功，已在后台保持常驻。")
         except Exception as e:
             logger.error(f"[AGY Run] ConPTY 启动失败: {e}")
 
     async def _pty_stdout_drainer(self):
-        """持续清空 PTY 输出缓冲区"""
-        while self.pty:
+        """持续清空 PTY 输出缓冲区并响应终端握手"""
+        while self.proc and self.proc.isalive():
             try:
-                # pty.read 在 Windows 上为阻塞读取，需在 executor 中运行防止卡死 asyncio 循环
-                data = await self.loop.run_in_executor(None, self.pty.read, 1024)
+                data = await self.loop.run_in_executor(None, self.proc.read, 4096)
                 if not data:
-                    break
-                sys.stdout.write(data)
-                sys.stdout.flush()
+                    await asyncio.sleep(0.05)
+                    continue
+                # 关键修复：agy 启动时会发送 \x1b[c 探测终端能力，必须应答 \x1b[?1;2c 才能打破启动挂起
+                if "\x1b[c" in data:
+                    logger.info("[AGY Run] 捕获到终端握手请求 (\\x1b[c)，已自动应答。")
+                    self.proc.write("\x1b[?1;2c")
+            except EOFError:
+                break
             except Exception:
                 break
 
     def terminate(self):
         """强行关闭当前常驻终端"""
         logger.info("[AGY Run] 正在关闭常驻 AI 进程...")
-        if self.pty:
+        if self.proc:
             try:
-                self.pty.close()
+                self.proc.terminate(force=True)
             except Exception:
                 pass
-            self.pty = None
+            self.proc = None
 
     async def send_message(self, msg: str):
         """模拟物理键盘输入将消息送给 AI 进程"""
-        if not self.pty:
+        if not self.proc or not self.proc.isalive():
             logger.warning("[AGY Run] AI 进程未启动，正在重新拉起...")
             self.start(fresh=False)
-            await asyncio.sleep(1.0)
+            await asyncio.sleep(2.0)
             
         async with self.write_lock:
             try:
                 logger.info(f"[Bridge -> AGY] 写入消息: {msg}")
+                self.last_sent_prompt = msg.strip()
+                self.last_sent_time = time.time()
                 # 发送 Escape 强退可能卡在 TUI 或 PAGER 的状态 (Windows下对应 \x1b)
-                self.pty.write("\x1b")
+                self.proc.write("\x1b")
                 await asyncio.sleep(0.3)
                 # 写入消息并敲回车 \r\n
-                self.pty.write(f"{msg}\r\n")
+                self.proc.write(f"{msg}\r\n")
             except Exception as e:
                 logger.error(f"[AGY Run] 写入虚拟终端失败: {e}")
 
     async def send_ctrl_c(self):
         """向常驻进程发送 Ctrl+C 中断信号"""
-        if self.pty:
+        if self.proc and self.proc.isalive():
             async with self.write_lock:
                 try:
                     logger.info("[AGY Run] 发送 Ctrl+C 中断指令...")
-                    # \x03 代表 ASCII 控制字符 Ctrl+C
-                    self.pty.write("\x03\x03\x03")
+                    self.proc.write("\x03\x03\x03")
                 except Exception as e:
                     logger.error(f"[AGY Run] 发送中断信号失败: {e}")
 
 # 全局进程管理器
 agy_mgr = AgyProcessManager()
 
-def find_latest_transcript(min_mtime: float) -> Optional[Path]:
-    """获取在 min_mtime 之后新修改/创建的最新 transcript.jsonl 日志文件"""
+def get_workspace_conv_id(workspace: Path) -> Optional[str]:
+    """从 last_conversations.json 读取指定工作区的最近会话 ID"""
+    if not LAST_CONV_FILE.exists():
+        return None
+    try:
+        with open(LAST_CONV_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        ws_str = str(workspace.resolve()).lower()
+        for path_key, conv_id in data.items():
+            try:
+                if str(Path(path_key).resolve()).lower() == ws_str:
+                    return conv_id
+            except Exception:
+                continue
+    except Exception as e:
+        logger.debug(f"读取 last_conversations.json 失败: {e}")
+    return None
+
+
+def get_conv_id_from_history(workspace: Optional[Path] = None, prompt_match: Optional[str] = None) -> Optional[str]:
+    """从 history.jsonl 末尾查找匹配工作区或 Prompt 的最新会话 ID"""
+    if not HISTORY_FILE.exists():
+        return None
+    try:
+        with open(HISTORY_FILE, "r", encoding="utf-8", errors="replace") as f:
+            lines = f.read().splitlines()
+        ws_str = str(workspace.resolve()).lower() if workspace else None
+        for line in reversed(lines[-30:]):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                item = json.loads(line)
+                cid = item.get("conversationId")
+                if not cid or cid in EXCLUDE_CONV_IDS:
+                    continue
+                if prompt_match and prompt_match in item.get("display", ""):
+                    return cid
+                if ws_str and item.get("workspace"):
+                    try:
+                        if str(Path(item.get("workspace")).resolve()).lower() == ws_str:
+                            return cid
+                    except Exception:
+                        pass
+            except Exception:
+                continue
+    except Exception as e:
+        logger.debug(f"读取 history.jsonl 失败: {e}")
+    return None
+
+
+def transcript_has_prompt(path: Path, prompt: str) -> bool:
+    """检查 transcript 日志前几行是否包含发送的 prompt"""
+    if not prompt:
+        return True
+    search_term = prompt[:30].strip()
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            for _ in range(10):
+                line = f.readline()
+                if not line:
+                    break
+                if search_term in line:
+                    return True
+    except Exception:
+        pass
+    return False
+
+
+def find_latest_transcript(min_mtime: float, require_prompt: Optional[str] = None) -> Optional[Path]:
+    """获取与当前 AGY 进程关联的最新 transcript.jsonl 日志文件"""
+    # 1. 显式指定的目标会话 ID（最高优先级）
+    if TARGET_CONV_ID:
+        target_path = BRAIN_DIR / TARGET_CONV_ID / ".system_generated" / "logs" / "transcript.jsonl"
+        if target_path.exists():
+            return target_path
+
+    # 2. 扫描所有候选 transcript.jsonl
     pattern = str(BRAIN_DIR / "*" / ".system_generated" / "logs" / "transcript.jsonl")
     paths = glob.glob(pattern.replace('\\', '/'))
     if not paths:
         return None
+
     paths_with_mtime = []
     for p in paths:
+        p_obj = Path(p)
+        conv_id = p_obj.parts[-4] if len(p_obj.parts) >= 4 else ""
+        if conv_id in EXCLUDE_CONV_IDS:
+            continue
         try:
             mtime = os.path.getmtime(p)
             if mtime >= min_mtime:
-                paths_with_mtime.append((Path(p), mtime))
+                paths_with_mtime.append((p_obj, mtime))
         except OSError:
             continue
+
     if not paths_with_mtime:
         return None
+
     paths_with_mtime.sort(key=lambda x: x[1], reverse=True)
+
+    # 3. 如果需要匹配 prompt（例如向新会话发送了首条指令），优先内容匹配
+    if require_prompt:
+        for p_obj, mtime in paths_with_mtime:
+            if transcript_has_prompt(p_obj, require_prompt):
+                return p_obj
+
+    # 4. 根据工作区从 last_conversations.json 辅助匹配
+    ws_conv_id = get_workspace_conv_id(AGY_WORKSPACE)
+    if ws_conv_id and ws_conv_id not in EXCLUDE_CONV_IDS:
+        for p_obj, mtime in paths_with_mtime:
+            if p_obj.parts[-4] == ws_conv_id:
+                return p_obj
+
     return paths_with_mtime[0][0]
 
 
 async def log_listener():
-    """纯异步增量日志广播协程：无脑在后台读取最新修改日志的增量并推送到 QQ。"""
+    """纯异步增量日志广播协程：绑定会话日志的增量并推送到 QQ。"""
     global _current_log_path, _last_log_size, _last_sent_timestamp
 
-    # 启动时，先扫描并绑定目前最新的日志（以当前 24 小时前为基线）
+    def bind_log(log_path: Path, is_cold_start: bool = False):
+        global _current_log_path, _last_log_size, _last_sent_timestamp
+        _current_log_path = log_path
+        if is_cold_start:
+            # 仅在服务首次冷启动时，跳过历史内容，防止启动时把历史回复全部推送
+            try:
+                _last_log_size = log_path.stat().st_size
+                with open(log_path, 'r', encoding='utf-8', errors='replace') as f:
+                    lines = f.read().splitlines()
+                for line in reversed(lines):
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        obj = json.loads(line)
+                        if obj.get("type") == "PLANNER_RESPONSE" and obj.get("source") == "MODEL":
+                            ts = obj.get("created_at")
+                            if ts:
+                                _last_sent_timestamp = ts
+                                break
+                    except Exception:
+                        continue
+            except OSError:
+                _last_log_size = 0
+        else:
+            # 运行中切换或新拉起会话：从 0 读取，确保新生成的回复不被漏发
+            _last_log_size = 0
+
+        logger.info(f"[Listener] Bound to log: {_current_log_path} (size={_last_log_size}, last_ts={_last_sent_timestamp}, cold_start={is_cold_start})")
+
+    # 启动时，先扫描并绑定目前最新的日志（以当前 24 小时前为基线，冷启动跳过旧历史）
     init_log = find_latest_transcript(time.time() - 86400.0)
     if init_log:
-        _current_log_path = init_log
-        try:
-            _last_log_size = init_log.stat().st_size
-            with open(init_log, 'r', encoding='utf-8', errors='replace') as f:
-                lines = f.read().splitlines()
-            for line in reversed(lines):
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    obj = json.loads(line)
-                    if obj.get("type") == "PLANNER_RESPONSE" and obj.get("source") == "MODEL":
-                        ts = obj.get("created_at")
-                        if ts:
-                            _last_sent_timestamp = ts
-                            break
-                except Exception:
-                    continue
-        except OSError:
-            _last_log_size = 0
-        logger.info(f"[Listener] Bound to existing active log: {_current_log_path} (size={_last_log_size}, last_ts={_last_sent_timestamp})")
+        bind_log(init_log, is_cold_start=True)
 
     while _running:
         await asyncio.sleep(0.5)
 
-        # 1. 动态探测是否有新修改的文件诞生
-        try:
-            latest_log = find_latest_transcript(time.time() - 86400.0)
-            if latest_log and (not _current_log_path or latest_log != _current_log_path):
-                _current_log_path = latest_log
-                _last_log_size = 0  # 绑定全新文件，从头读起
-                logger.info(f"[Listener] Switched to newer active log: {_current_log_path}")
-        except Exception as e:
-            logger.error(f"[Listener] Scan error: {e}")
+        # 1. 尚未绑定日志，或者进程管理器显式触发重置 (/new, /reset) 时探测新日志
+        if not _current_log_path or agy_mgr.needs_rebind:
+            try:
+                min_mtime = agy_mgr.fresh_time if agy_mgr.fresh_time > 0 else (time.time() - 86400.0)
+                latest_log = find_latest_transcript(min_mtime, require_prompt=agy_mgr.last_sent_prompt)
+                if latest_log:
+                    if not _current_log_path or latest_log != _current_log_path:
+                        bind_log(latest_log, is_cold_start=False)
+                    agy_mgr.needs_rebind = False
+                    agy_mgr.fresh_time = 0.0
+            except Exception as e:
+                logger.error(f"[Listener] Scan error: {e}")
 
         if not _current_log_path:
             continue
