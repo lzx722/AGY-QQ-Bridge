@@ -12,10 +12,13 @@ import re
 import os
 import sys
 import time
+import datetime
 import uuid
 import logging
 import glob
-from typing import Optional, Dict, Any
+import sqlite3
+import urllib.parse
+from typing import Optional, Dict, Any, List, Tuple
 from pathlib import Path
 
 # ================= 环境与配置加载 =================
@@ -55,8 +58,16 @@ MAX_RECONNECT_ATTEMPTS = 100
 HEARTBEAT_INTERVAL = 15.0
 
 # 路径与命令配置化
-BRAIN_DIR = Path(os.environ.get("BRAIN_DIR", str(Path.home() / ".gemini/antigravity-cli/brain")))
+CLI_HOME = Path(os.environ.get("CLI_HOME", str(Path.home() / ".gemini/antigravity-cli")))
+BRAIN_DIR = Path(os.environ.get("BRAIN_DIR", str(CLI_HOME / "brain")))
 LOG_DIR = Path(os.environ.get("LOG_DIR", str(Path.home() / ".agy-qq-bridge")))
+HISTORY_FILE = CLI_HOME / "history.jsonl"
+CONVERSATIONS_DIR = CLI_HOME / "conversations"
+CONV_SUMMARIES_DB = CLI_HOME / "conversation_summaries.db"
+LAST_CONV_FILE = CLI_HOME / "cache" / "last_conversations.json"
+EXCLUDE_CONV_IDS = set(
+    cid.strip() for cid in os.environ.get("EXCLUDE_CONV_IDS", "").split(",") if cid.strip()
+)
 
 os.makedirs(LOG_DIR, exist_ok=True)
 
@@ -69,6 +80,591 @@ logging.basicConfig(
     ],
 )
 logger = logging.getLogger("agy_qq_bridge")
+
+
+def extract_prompt_from_transcript(cid: str) -> str:
+    """尝试从 transcript.jsonl 中提取首个用户请求的内容作为标题"""
+    transcript_file = BRAIN_DIR / cid / ".system_generated" / "logs" / "transcript.jsonl"
+    if not transcript_file.exists():
+        return ""
+    try:
+        with open(transcript_file, "r", encoding="utf-8", errors="replace") as f:
+            for _ in range(10):
+                line = f.readline()
+                if not line:
+                    break
+                obj = json.loads(line)
+                if obj.get("type") == "USER_INPUT":
+                    content = obj.get("content", "")
+                    m = re.search(r"<USER_REQUEST>(.*?)</USER_REQUEST>", content, re.DOTALL)
+                    raw = m.group(1).strip() if m else content.strip()
+                    if raw and not raw.startswith("/"):
+                        return raw
+    except Exception:
+        pass
+    return ""
+
+
+def parse_timestamp(ts: Any) -> float:
+    """统一将各类格式的 timestamp (ISO 字符串、毫秒数值、秒浮点数) 解析为 Unix 秒时间戳 (float)"""
+    if not ts:
+        return 0.0
+    if isinstance(ts, (int, float)):
+        return ts / 1000.0 if ts > 1e11 else float(ts)
+    if isinstance(ts, str):
+        ts_str = ts.strip()
+        try:
+            val = float(ts_str)
+            return val / 1000.0 if val > 1e11 else val
+        except ValueError:
+            pass
+        try:
+            clean_ts = re.sub(r"(\.\d{6})\d+", r"\1", ts_str)
+            dt = datetime.datetime.fromisoformat(clean_ts)
+            return dt.timestamp()
+        except Exception:
+            pass
+    return 0.0
+
+
+def shorten_workspace(ws: str) -> str:
+    r"""智能缩短工作区路径展示，如 /home/user/project -> project，主目录 -> ~"""
+    if not ws:
+        return "默认"
+    try:
+        p = Path(ws)
+        home = Path.home()
+        if p.resolve() == home.resolve():
+            return "~"
+        name = p.name or str(p)
+        return name
+    except Exception:
+        return ws
+
+
+def parse_history_range(
+    parts: List[str],
+    total_count: int,
+    default_limit: int = 5,
+    max_page_size: int = 15
+) -> Tuple[Optional[int], Optional[int], Optional[str]]:
+    """
+    解析 /history 后的参数，返回 1-indexed (start_idx, end_idx, err_msg)。
+    若参数格式非法或超出限制，start_idx 与 end_idx 为 None，返回明确的错误提示。
+    支持合法格式:
+      /history              -> 默认前 5 条 (1~5)
+      /history 10           -> 前 10 条 (1~10)
+      /history 31-40        -> 连字符范围 (31~40)
+      /history 30~40        -> 波浪号范围 (30~40)
+      /history 31 40        -> 两数范围 (31~40)
+      /history p4 / page 4  -> 分页模式第4页 (31~40，每页10条)
+      /history 页 4 / 页4   -> 中文分页模式 (31~40)
+      /history 10 p4        -> 自定义每页10条第4页 (31~40)
+    """
+    args = parts[1:] if len(parts) > 1 else []
+    if not args:
+        return 1, min(default_limit, total_count), None
+
+    # 参数过多检查
+    if len(args) > 2:
+        return None, None, (
+            f"⚠️ **参数过多**（输入了 {len(args)} 个参数）。\n\n"
+            "• `/history` 支持的常用格式：\n"
+            "  - 查看前 N 条：`/history 10`（单次上限 15 条）\n"
+            "  - 查看指定范围：`/history 31-40` 或 `/history 31 40`\n"
+            "  - 查看指定页码：`/history p4` 或 `/history page 4`"
+        )
+
+    # 单参数情形
+    if len(args) == 1:
+        raw_arg = args[0].strip()
+
+        # 格式1: 单参数内含范围 31-40, 31~40, 31..40
+        m_range = re.match(r"^(\d+)[-~.]{1,2}(\d+)$", raw_arg)
+        if m_range:
+            n1, n2 = int(m_range.group(1)), int(m_range.group(2))
+            if n1 <= 0 or n2 <= 0:
+                return None, None, "⚠️ 会话序号从 1 开始，不能包含 0 或负数。有效范围示例：`/history 1-10`"
+            start = min(n1, n2)
+            end = max(n1, n2)
+            if end - start + 1 > max_page_size:
+                end = start + max_page_size - 1
+            return start, end, None
+
+        # 格式2: 单参数页码 p4, page4, 页4
+        m_page = re.match(r"^(?:p|page|页)(\d+)$", raw_arg, re.I)
+        if m_page:
+            page = int(m_page.group(1))
+            if page <= 0:
+                return None, None, "⚠️ 页码必须大于等于 1（示例：`/history p1`）。"
+            page_size = 10
+            start = (page - 1) * page_size + 1
+            end = start + page_size - 1
+            return start, end, None
+
+        # 格式3: 单纯数字，如 /history 10
+        if raw_arg.isdigit():
+            val = int(raw_arg)
+            if val <= 0:
+                return None, None, "⚠️ 查询数量必须大于 0（示例：`/history 10`）。"
+            limit = min(val, max_page_size)
+            return 1, limit, None
+
+        # 单参数未能识别
+        return None, None, (
+            f"⚠️ 无法识别的参数格式「{raw_arg}」。\n\n"
+            "• 支持的格式：\n"
+            "  - 数量模式：`/history 10`（查看前 10 条，单次上限 15 条）\n"
+            "  - 范围模式：`/history 31-40` 或 `/history 31~40`\n"
+            "  - 分页模式：`/history p4` 或 `/history page 4`"
+        )
+
+    # 双参数情形 len(args) == 2
+    arg1, arg2 = args[0].strip(), args[1].strip()
+
+    # 格式 A: p 4 / page 4 / 页 4
+    if arg1.lower() in ["p", "page", "页"]:
+        if arg2.isdigit():
+            page = int(arg2)
+            if page <= 0:
+                return None, None, "⚠️ 页码必须大于等于 1（示例：`/history page 1`）。"
+            page_size = 10
+            start = (page - 1) * page_size + 1
+            end = start + page_size - 1
+            return start, end, None
+        else:
+            return None, None, f"⚠️ 页码「{arg2}」无效，请输入正整数页码（示例：`/history page 2`）。"
+
+    # 格式 B: 10 p4 / 31 40
+    if arg1.isdigit():
+        v1 = int(arg1)
+        if v1 <= 0:
+            return None, None, "⚠️ 起始序号或每页数量必须大于 0。"
+
+        # 10 p4
+        if arg2.lower().startswith(("p", "page", "页")):
+            m_p2 = re.match(r"^(?:p|page|页)(\d+)$", arg2, re.I)
+            if m_p2:
+                v2 = int(m_p2.group(1))
+                if v2 <= 0:
+                    return None, None, "⚠️ 页码必须大于等于 1。"
+                page_size = min(v1, max_page_size)
+                start = (v2 - 1) * page_size + 1
+                end = start + page_size - 1
+                return start, end, None
+            else:
+                return None, None, f"⚠️ 页码「{arg2}」无效，示例：`/history 10 p4`。"
+
+        # 31 40 (两数范围)
+        if arg2.isdigit():
+            v2 = int(arg2)
+            if v2 <= 0:
+                return None, None, "⚠️ 结束序号必须大于 0。"
+            start = min(v1, v2)
+            end = max(v1, v2)
+            if end - start + 1 > max_page_size:
+                end = start + max_page_size - 1
+            return start, end, None
+
+        return None, None, f"⚠️ 无法识别的范围结束参数「{arg2}」，两数范围示例：`/history 31 40`。"
+
+    return None, None, (
+        f"⚠️ 无法识别的双参数组合「{arg1} {arg2}」。\n\n"
+        "• 支持的双参数格式：\n"
+        "  - 范围查询：`/history 31 40`\n"
+        "  - 分页查询：`/history page 4` 或 `/history 10 p4`"
+    )
+
+
+def get_workspace_conv_id(workspace: Path) -> Optional[str]:
+    """从 last_conversations.json 读取指定工作区的最近会话 ID"""
+    if not LAST_CONV_FILE.exists():
+        return None
+    try:
+        with open(LAST_CONV_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        ws_str = str(workspace.resolve()).lower()
+        for path_key, conv_id in data.items():
+            try:
+                if str(Path(path_key).resolve()).lower() == ws_str:
+                    return conv_id
+            except Exception:
+                continue
+    except Exception as e:
+        logger.debug(f"读取 last_conversations.json 失败: {e}")
+    return None
+
+
+def get_conversation_title(cid: str) -> str:
+    """获取指定会话在持久层存储中的当前主题名称"""
+    # 1. 优先读取 AGY 官方原生持久化注解文件 annotations/<cid>.pbtxt
+    ann_file = CLI_HOME / "annotations" / f"{cid}.pbtxt"
+    if ann_file.exists():
+        try:
+            txt = ann_file.read_text(encoding="utf-8", errors="replace").strip()
+            m = re.search(r'title\s*:\s*"(.*)"', txt)
+            if m:
+                val = m.group(1).replace('\\"', '"').replace('\\\\', '\\')
+                if val:
+                    return val
+        except Exception:
+            pass
+
+    # 2. 尝试从 conversation_summaries.db 读取
+    if CONV_SUMMARIES_DB.exists():
+        try:
+            conn = sqlite3.connect(str(CONV_SUMMARIES_DB))
+            c = conn.cursor()
+            c.execute("SELECT title, preview FROM conversation_summaries WHERE conversation_id = ?", (cid,))
+            row = c.fetchone()
+            conn.close()
+            if row and (row[0] or row[1]):
+                return row[0] or row[1]
+        except Exception:
+            pass
+
+    return extract_prompt_from_transcript(cid) or "未命名会话"
+
+
+def validate_rename_title(new_title: str) -> Tuple[bool, str]:
+    """
+    校验 /rename 的参数，防止误将 /resume 或 /history 的参数/指令当作主题写入。
+    返回 (is_valid, error_message)
+    """
+    t = new_title.strip()
+    if not t:
+        return False, "⚠️ 会话新主题不能为空。"
+
+    lower_t = t.lower()
+    parts_t = t.split()
+
+    # 1. 检查是否误输入为系统控制指令（如 /status, /help, /new, /stop 等）
+    if lower_t in ["status", "/status", "状态", "/状态", "help", "/help", "帮助", "/帮助", "new", "/new", "reset", "/reset", "清空", "/清空", "stop", "/stop", "停止", "/停止"]:
+        cmd_name = t if t.startswith('/') else '/' + t
+        return False, (
+            f"⚠️ 输入的参数为机器人控制指令「{t}」。\n\n"
+            f"👉 若要执行该指令，请直接发送：`{cmd_name}`\n"
+            f"• 若要重命名当前会话，请输入具体的描述文本（例如：`/rename 优化登录逻辑`）"
+        )
+
+    # 2. 检查是否误输入为 resume/switch 相关指令或带参指令
+    if lower_t in ["resume", "/resume", "switch", "/switch", "切换", "/切换"]:
+        return False, (
+            "⚠️ 输入的参数为恢复会话指令。若要恢复会话，请直接使用：`/resume <编号>`。"
+        )
+    if lower_t.startswith(("/resume", "/switch", "/切换")):
+        sub = t.split(None, 1)[1].strip() if len(parts_t) > 1 else ""
+        return False, (
+            f"⚠️ 检测到参数包含恢复会话指令「{t}」！\n\n"
+            f"👉 若要恢复会话，请直接使用：`/resume {sub}`\n"
+            f"• 若要重命名当前会话，请输入具体的描述文本（例如：`/rename 优化登录逻辑`）"
+        )
+    if parts_t[0].lower() in ["resume", "switch", "切换"] and len(parts_t) > 1:
+        sub = " ".join(parts_t[1:])
+        return False, (
+            f"⚠️ 检测到参数疑似想要恢复会话「{t}」！\n\n"
+            f"👉 请直接使用指令：`/resume {sub}`\n"
+            f"• 若要重命名当前会话，请输入具体的描述文本（例如：`/rename 优化登录逻辑`）"
+        )
+
+    # 3. 检查是否误输入为 history/sessions 相关指令或带参指令
+    if lower_t in ["history", "/history", "sessions", "/sessions", "历史", "/历史"]:
+        return False, (
+            "⚠️ 输入的参数为历史会话查询指令。若要查看历史列表，请直接使用：`/history`。"
+        )
+    if lower_t.startswith(("/history", "/sessions", "/历史")):
+        sub = t.split(None, 1)[1].strip() if len(parts_t) > 1 else ""
+        return False, (
+            f"⚠️ 检测到参数包含历史查询指令「{t}」！\n\n"
+            f"👉 若要查看历史会话，请直接使用：`/history {sub}`\n"
+            f"• 若要重命名当前会话，请输入具体的描述文本（例如：`/rename 优化登录逻辑`）"
+        )
+    if parts_t[0].lower() in ["history", "sessions", "历史"] and len(parts_t) > 1:
+        sub = " ".join(parts_t[1:])
+        if (
+            parts_t[1].isdigit()
+            or re.match(r"^\d+[-~.]{1,2}\d+$", parts_t[1])
+            or re.match(r"^(?:p|page|页)\d*$", parts_t[1], re.I)
+        ):
+            return False, (
+                f"⚠️ 检测到参数疑似想要查看历史列表「{t}」！\n\n"
+                f"👉 请直接使用指令：`/history {sub}`\n"
+                f"• 若要重命名当前会话，请输入具体的描述文本（例如：`/rename 优化登录逻辑`）"
+            )
+
+    # 4. 检查是否为单编号（纯数字、带#号、括号等，如 1, #1, [1], 12）
+    clean_num = t.lstrip("#-").strip("[]()").rstrip(".、")
+    if clean_num.isdigit():
+        return False, (
+            f"⚠️ 检测到参数「{t}」为纯数字编号，不能作为会话主题！\n\n"
+            f"• 若您想切换至该会话，请使用：`/resume {clean_num}`\n"
+            f"• 若您想查看前 {clean_num} 个会话，请使用：`/history {clean_num}`\n"
+            f"• 若您想重命名当前会话，请输入具体的描述文本（例如：`/rename 优化登录逻辑`）"
+        )
+
+    # 5. 检查是否为 history 范围参数（如 31-40, 31~40, 31..40 或两数 31 40）
+    m_range = re.match(r"^(\d+)[-~.]{1,2}(\d+)$", t)
+    if m_range:
+        return False, (
+            f"⚠️ 检测到范围参数「{t}」，疑似想要查看历史会话！\n\n"
+            f"👉 若要查看第 {t} 项会话列表，请使用：`/history {t}`\n"
+            f"• 若要重命名当前会话，请输入具体的描述文本（例如：`/rename 优化登录逻辑`）"
+        )
+    if len(parts_t) == 2 and parts_t[0].isdigit() and parts_t[1].isdigit():
+        return False, (
+            f"⚠️ 检测到两数范围参数「{t}」，疑似想要查看历史会话！\n\n"
+            f"👉 若要查看第 {t} 项会话列表，请使用：`/history {t}`\n"
+            f"• 若要重命名当前会话，请输入具体的描述文本（例如：`/rename 优化登录逻辑`）"
+        )
+
+    # 6. 检查是否为 history 分页参数（如 p4, page 4, 页 4, 10 p4, 10 page 4）
+    if re.match(r"^(?:p|page|页)\s*\d+$", t, re.I):
+        return False, (
+            f"⚠️ 检测到页码参数「{t}」，疑似想要翻页查看历史会话！\n\n"
+            f"👉 若要查看该页会话列表，请使用：`/history {t}`\n"
+            f"• 若要重命名当前会话，请输入具体的描述文本（例如：`/rename 优化登录逻辑`）"
+        )
+    if (len(parts_t) == 2 and parts_t[0].isdigit() and re.match(r"^(?:p|page|页)\d+$", parts_t[1], re.I)) or \
+       (len(parts_t) == 3 and parts_t[0].isdigit() and parts_t[1].lower() in ["p", "page", "页"] and parts_t[2].isdigit()):
+        return False, (
+            f"⚠️ 检测到分页参数「{t}」，疑似想要翻页查看历史会话！\n\n"
+            f"👉 若要查看该页会话列表，请使用：`/history {t}`\n"
+            f"• 若要重命名当前会话，请输入具体的描述文本（例如：`/rename 优化登录逻辑`）"
+        )
+
+    # 7. 检查是否为内部会话 UUID 格式
+    uuid_pattern = r"^[0-9a-fA-F]{8}-?[0-9a-fA-F]{4}-?[0-9a-fA-F]{4}-?[0-9a-fA-F]{4}-?[0-9a-fA-F]{12}$"
+    if re.match(uuid_pattern, t):
+        return False, (
+            f"⚠️ 检测到参数为内部会话 UUID，不能作为会话主题！\n\n"
+            f"• 如需修改会话主题，请输入易于识别的文本（例如：`/rename 项目代码重构`）"
+        )
+
+    # 8. 长度限制
+    if len(t) > 100:
+        return False, "⚠️ 会话新主题长度过长（建议控制在 50 字以内）。"
+
+    return True, ""
+
+
+def rename_conversation(cid: str, new_title: str) -> Tuple[bool, str]:
+    """重命名指定会话的主题。
+    持久化同步更新：
+    1. ~/.gemini/antigravity-cli/annotations/<cid>.pbtxt (AGY 原生持久化主题文件，防止重启被覆盖)
+    2. ~/.gemini/antigravity-cli/cache/conversation_metadata.json (元数据缓存)
+    3. ~/.gemini/antigravity-cli/conversation_summaries.db (SQLite 历史快照库)
+    返回 (是否成功, 旧主题名称)
+    """
+    old_title = get_conversation_title(cid)
+    is_valid, _ = validate_rename_title(new_title)
+    if not is_valid:
+        return False, old_title
+    success = False
+
+    # 1. 写入 AGY 原生 annotations/<cid>.pbtxt
+    try:
+        ann_dir = CLI_HOME / "annotations"
+        ann_dir.mkdir(parents=True, exist_ok=True)
+        ann_file = ann_dir / f"{cid}.pbtxt"
+        escaped_title = new_title.replace("\\", "\\\\").replace('"', '\\"')
+        ann_file.write_text(f'title:"{escaped_title}"\n', encoding="utf-8")
+        success = True
+    except Exception as e:
+        logger.warning(f"写入 annotations pbtxt 失败: {e}")
+
+    # 2. 同步更新 cache/conversation_metadata.json (若存在)
+    try:
+        meta_file = CLI_HOME / "cache" / "conversation_metadata.json"
+        if meta_file.exists():
+            data = json.loads(meta_file.read_text(encoding="utf-8"))
+            conv_meta = data.get("conversations", {}).get(cid)
+            if conv_meta and isinstance(conv_meta, dict):
+                summary = conv_meta.get("summary")
+                if summary and isinstance(summary, dict):
+                    summary["Title"] = new_title
+                    meta_file.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception as e:
+        logger.debug(f"更新 conversation_metadata.json 失败: {e}")
+
+    # 3. 更新 SQLite conversation_summaries.db
+    if CONV_SUMMARIES_DB.exists():
+        try:
+            conn = sqlite3.connect(str(CONV_SUMMARIES_DB))
+            c = conn.cursor()
+            c.execute("UPDATE conversation_summaries SET title = ? WHERE conversation_id = ?", (new_title, cid))
+            rows = c.rowcount
+            if rows == 0:
+                c.execute(
+                    "INSERT OR REPLACE INTO conversation_summaries (conversation_id, title, preview, last_modified_time) VALUES (?, ?, ?, ?)",
+                    (cid, new_title, new_title, time.strftime("%Y-%m-%d %H:%M:%S+00:00"))
+                )
+            conn.commit()
+            conn.close()
+            success = True
+        except Exception as e:
+            logger.error(f"重命名会话更新 SQLite 失败: {e}")
+
+    return success, old_title
+
+
+def get_history_conversations() -> List[Dict[str, Any]]:
+    """获取所有有效历史会话并按最后活动时间倒序排序。
+    与 AGY 原生 /resume 选择器保持 100% 规则对齐：
+    1. 优先扫描 conversations/ 目录与 conversation_summaries.db。
+    2. 过滤掉无步骤（steps == 0，即初始空库 48KB）的无效/空会话。
+    3. 提取官方格式化标题或预览摘要、原始工作区与最后修改时间。
+    4. 若上述存储不存在则优雅降级读取 history.jsonl。
+    """
+    valid_cids = {}
+    if CONVERSATIONS_DIR.exists():
+        try:
+            with os.scandir(CONVERSATIONS_DIR) as entries:
+                for entry in entries:
+                    name = entry.name
+                    if name.endswith(".pb"):
+                        cid = name[:-3]
+                        if cid not in EXCLUDE_CONV_IDS:
+                            valid_cids[cid] = entry.stat().st_mtime
+                    elif name.endswith(".db"):
+                        # SQLite 初始空数据库大小严格为 49152 字节 (48KB)
+                        # 有实际对话 steps 的数据库大小均 >= 216KB
+                        if entry.stat().st_size > 49152:
+                            cid = name[:-3]
+                            if cid not in EXCLUDE_CONV_IDS:
+                                valid_cids[cid] = entry.stat().st_mtime
+        except Exception as e:
+            logger.debug(f"扫描 conversations 目录异常: {e}")
+
+    # 若成功识别到有效会话，优先从 conversation_summaries.db 提取元数据
+    if valid_cids and CONV_SUMMARIES_DB.exists():
+        try:
+            conn = sqlite3.connect(str(CONV_SUMMARIES_DB))
+            c = conn.cursor()
+            c.execute("SELECT conversation_id, title, preview, workspace_uris, last_modified_time FROM conversation_summaries")
+            convs = []
+            seen_cids = set()
+            for cid, title, preview, ws_uris, mtime in c.fetchall():
+                if cid in valid_cids:
+                    seen_cids.add(cid)
+                    ws = ""
+                    if ws_uris:
+                        try:
+                            uris = json.loads(ws_uris)
+                            if uris and isinstance(uris, list):
+                                raw_path = uris[0]
+                                if raw_path.startswith("file:///"):
+                                    raw_path = raw_path[8:]
+                                elif raw_path.startswith("file://"):
+                                    raw_path = raw_path[7:]
+                                ws = urllib.parse.unquote(raw_path)
+                        except Exception:
+                            pass
+
+                    # 优先读取 annotations/<cid>.pbtxt 中的用户自定义标题
+                    ann_title = ""
+                    ann_file = CLI_HOME / "annotations" / f"{cid}.pbtxt"
+                    if ann_file.exists():
+                        try:
+                            txt = ann_file.read_text(encoding="utf-8", errors="replace").strip()
+                            m = re.search(r'title\s*:\s*"(.*)"', txt)
+                            if m:
+                                ann_title = m.group(1).replace('\\"', '"').replace('\\\\', '\\')
+                        except Exception:
+                            pass
+
+                    final_title = ann_title or title or preview or ""
+                    if not final_title:
+                        final_title = extract_prompt_from_transcript(cid) or "无标题会话"
+
+                    ts_val = parse_timestamp(mtime) if mtime else valid_cids.get(cid, 0.0)
+                    convs.append({
+                        "cid": cid,
+                        "final_title": final_title,
+                        "workspace": ws,
+                        "last_timestamp": ts_val
+                    })
+            conn.close()
+
+            # 补充极少数不在 summaries.db 中的有效会话
+            for cid in set(valid_cids.keys()) - seen_cids:
+                convs.append({
+                    "cid": cid,
+                    "final_title": extract_prompt_from_transcript(cid) or "历史会话",
+                    "workspace": "",
+                    "last_timestamp": valid_cids[cid]
+                })
+
+            convs.sort(key=lambda x: parse_timestamp(x.get("last_timestamp")), reverse=True)
+            return convs
+        except Exception as e:
+            logger.error(f"读取 conversation_summaries.db 异常: {e}")
+
+    # 降级兜底方案：从 history.jsonl 解析
+    convs = {}
+    if HISTORY_FILE.exists():
+        try:
+            with open(HISTORY_FILE, "r", encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        d = json.loads(line)
+                        cid = d.get("conversationId")
+                        if not cid or cid in EXCLUDE_CONV_IDS:
+                            continue
+                        display = d.get("display", "").strip()
+                        ws = d.get("workspace", "")
+                        ts = d.get("timestamp", 0)
+
+                        if cid not in convs:
+                            convs[cid] = {
+                                "cid": cid,
+                                "title": display,
+                                "workspace": ws,
+                                "last_timestamp": ts,
+                                "prompts_count": 1,
+                                "real_prompt": not display.startswith("/"),
+                            }
+                        else:
+                            convs[cid]["prompts_count"] += 1
+                            if ts > convs[cid]["last_timestamp"]:
+                                convs[cid]["last_timestamp"] = ts
+                            if not display.startswith("/"):
+                                convs[cid]["real_prompt"] = True
+                                if convs[cid]["title"].startswith("/") or not convs[cid]["title"]:
+                                    convs[cid]["title"] = display
+                            if ws and not convs[cid]["workspace"]:
+                                convs[cid]["workspace"] = ws
+                    except Exception:
+                        pass
+        except Exception as e:
+            logger.error(f"读取 history.jsonl 失败: {e}")
+
+    valid_convs = []
+    for c in convs.values():
+        title = c["title"]
+        if not c["real_prompt"] or title.startswith("/"):
+            t_from_file = extract_prompt_from_transcript(c["cid"])
+            if t_from_file:
+                title = t_from_file
+                c["real_prompt"] = True
+
+        if not c["real_prompt"] and title in ["/new", "/resume"]:
+            continue
+
+        c["final_title"] = title
+        valid_convs.append(c)
+
+    valid_convs.sort(key=lambda x: parse_timestamp(x.get("last_timestamp")), reverse=True)
+    return valid_convs
+
+
+def _log_task_exception(t):
+    if not t.cancelled():
+        exc = t.exception()
+        if exc:
+            logger.error(f"[Task Error] 异步任务执行异常: {exc}", exc_info=exc)
 
 
 class QQBridge:
@@ -106,6 +702,20 @@ class QQBridge:
         self.last_sent_timestamp = ""  # 记录最后发送给 QQ 的消息时间戳，防重与防历史刷屏
         self.is_busy = False
         self.last_sent_time = 0.0
+        self.cached_history_list: List[Dict[str, Any]] = []
+        self.last_history_time: float = 0.0
+        self.history_resume_count: int = 0
+        self.agy_workspace = Path(os.environ.get("AGY_WORKSPACE", str(Path.home()))).resolve()
+        self.needs_rebind = False
+
+    def get_current_conv_id(self) -> Optional[str]:
+        """获取当前已绑定的活跃会话 ID"""
+        if self.current_log_path and len(self.current_log_path.parts) >= 4:
+            return self.current_log_path.parts[-4]
+        ws_cid = get_workspace_conv_id(self.agy_workspace)
+        if ws_cid:
+            return ws_cid
+        return None
 
     def get_http_client(self):
         if self.http_client is None:
@@ -286,16 +896,13 @@ class QQBridge:
         paths_with_mtime.sort(key=lambda x: x[1], reverse=True)
         return paths_with_mtime[0][0]
 
-    async def log_listener(self):
-        """纯异步增量日志广播协程：无脑在后台读取最新修改日志的增量并推送到 QQ。"""
-        # 启动时，先扫描并绑定目前最新的日志（以当前 24 小时前为基线）
-        init_log = self.find_latest_transcript(time.time() - 86400.0)
-        if init_log:
-            self.current_log_path = init_log
+    def bind_log(self, log_path: Path, skip_history: bool = False):
+        """绑定目标日志并设定偏移指针"""
+        self.current_log_path = log_path
+        if skip_history:
             try:
-                self.last_log_size = init_log.stat().st_size
-                # 扫描已有的历史日志，提取最新一条回复的时间戳，进行时间锁死防止历史刷屏
-                with open(init_log, 'r', encoding='utf-8', errors='replace') as f:
+                self.last_log_size = log_path.stat().st_size
+                with open(log_path, 'r', encoding='utf-8', errors='replace') as f:
                     lines = f.read().splitlines()
                 for line in reversed(lines):
                     line = line.strip()
@@ -312,20 +919,72 @@ class QQBridge:
                         continue
             except OSError:
                 self.last_log_size = 0
-            logger.info(f"[Listener] Bound to existing active log: {self.current_log_path} (size={self.last_log_size}, last_ts={self.last_sent_timestamp})")
+        else:
+            self.last_log_size = 0
+        logger.info(f"[Listener] Bound to log: {self.current_log_path} (size={self.last_log_size}, last_ts={self.last_sent_timestamp}, skip_history={skip_history})")
+
+    async def restart_agy(self, conversation_id: Optional[str] = None, cwd: Optional[Path] = None):
+        """强杀并重新拉起 tmux session 中的 AGY 进程"""
+        target_cwd = cwd if (cwd and cwd.exists()) else self.agy_workspace
+        self.is_busy = False
+
+        # 1. 强杀现有 tmux session
+        proc_kill = await asyncio.create_subprocess_shell(f"tmux kill-session -t {self.tmux_session} 2>/dev/null || true")
+        await proc_kill.communicate()
+        await asyncio.sleep(0.5)
+
+        # 2. 强建 tmux session 并指定工作目录
+        proc_new = await asyncio.create_subprocess_exec("tmux", "new-session", "-d", "-s", self.tmux_session, "-c", str(target_cwd))
+        await proc_new.communicate()
+        await asyncio.sleep(2.0)
+
+        # 3. 启动 AGY
+        if conversation_id:
+            cmd = f"agy --dangerously-skip-permissions --conversation {conversation_id}"
+            self.needs_rebind = False
+        else:
+            cmd = self.agy_start_cmd
+            self.needs_rebind = True
+
+        proc_start = await asyncio.create_subprocess_exec(
+            "tmux", "send-keys", "-t", f"{self.tmux_session}:", cmd, "Enter"
+        )
+        await proc_start.communicate()
+
+        # 4. 确认信任提示
+        await asyncio.sleep(4.0)
+        proc_enter = await asyncio.create_subprocess_exec(
+            "tmux", "send-keys", "-t", f"{self.tmux_session}:", "Enter", ""
+        )
+        await proc_enter.communicate()
+
+        if cwd and cwd.exists():
+            self.agy_workspace = target_cwd.resolve()
+
+        if conversation_id:
+            target_log = BRAIN_DIR / conversation_id / ".system_generated" / "logs" / "transcript.jsonl"
+            if target_log.exists():
+                self.bind_log(target_log, skip_history=True)
+
+    async def log_listener(self):
+        """纯异步增量日志广播协程：无脑在后台读取最新修改日志的增量并推送到 QQ。"""
+        # 启动时，先扫描并绑定目前最新的日志（以当前 24 小时前为基线）
+        init_log = self.find_latest_transcript(time.time() - 86400.0)
+        if init_log:
+            self.bind_log(init_log, skip_history=True)
 
         while self.running:
             await asyncio.sleep(0.5)
 
-            # 1. 动态探测是否有新修改的文件诞生（比如重置会话拉起新 UUID 目录）
-            try:
-                latest_log = self.find_latest_transcript(time.time() - 86400.0)
-                if latest_log and (not self.current_log_path or latest_log != self.current_log_path):
-                    self.current_log_path = latest_log
-                    self.last_log_size = 0  # 绑定全新文件，从头读起
-                    logger.info(f"[Listener] Switched to newer active log: {self.current_log_path}")
-            except Exception as e:
-                logger.error(f"[Listener] Scan error: {e}")
+            # 1. 尚未绑定日志，或者显式触发重置时探测新修改的文件诞生
+            if not self.current_log_path or self.needs_rebind:
+                try:
+                    latest_log = self.find_latest_transcript(time.time() - 86400.0)
+                    if latest_log and (not self.current_log_path or latest_log != self.current_log_path):
+                        self.bind_log(latest_log, skip_history=False)
+                        self.needs_rebind = False
+                except Exception as e:
+                    logger.error(f"[Listener] Scan error: {e}")
 
             if not self.current_log_path:
                 continue
@@ -488,34 +1147,246 @@ async def get_local_git_status(workspace: Path) -> str:
         self.last_message_source = {"type": "c2c", "openid": user_openid, "reply_to": None}
 
         # 命令处理
-        if content.strip().lower() in ["/new", "/reset", "/清空", "/新对话", "new", "reset"]:
+        parts = content.strip().split()
+        cmd = parts[0].lower() if parts else ""
+
+        if cmd in ["/new", "/reset", "/清空", "/新对话", "new", "reset"]:
             logger.info("[Recv] New session command received")
+            self.cached_history_list = []
+            self.last_history_time = 0.0
+            self.history_resume_count = 0
             self.group_chat_buffer.clear()
-
-            # 1. 强杀 tmux s0
-            proc_kill = await asyncio.create_subprocess_shell(f"tmux kill-session -t {self.tmux_session} 2>/dev/null || true")
-            await proc_kill.communicate()
-            await asyncio.sleep(0.5)
-
-            # 2. 强建 tmux s0
-            proc_new = await asyncio.create_subprocess_exec("tmux", "new-session", "-d", "-s", self.tmux_session)
-            await proc_new.communicate()
-            await asyncio.sleep(2.0)
-
-            # 3. 启动 AGY
-            proc_start = await asyncio.create_subprocess_exec(
-                "tmux", "send-keys", "-t", f"{self.tmux_session}:", self.agy_start_cmd, "Enter"
-            )
-            await proc_start.communicate()
-
-            # 4. 确认信任提示
-            await asyncio.sleep(4.0)
-            proc_enter = await asyncio.create_subprocess_exec(
-                "tmux", "send-keys", "-t", f"{self.tmux_session}:", "Enter", ""
-            )
-            await proc_enter.communicate()
-
+            self.current_log_path = None
+            self.last_log_size = 0
+            self.last_sent_timestamp = ""
+            await self.restart_agy(conversation_id=None)
             reply = "✅ 已强杀并重建 tmux 会话，重新拉起全新 AGY。上下文已完全重置。"
+            await self.send_message_rest(user_openid, reply)
+            return
+
+        if cmd in ["/history", "/历史", "/sessions", "history"]:
+            logger.info(f"[Recv] History list requested: {content}")
+            all_convs = get_history_conversations()
+            total_len = len(all_convs)
+
+            if not all_convs:
+                reply = "ℹ️ 未找到任何历史会话记录。"
+                await self.send_message_rest(user_openid, reply)
+                return
+
+            start_idx, end_idx, err_msg = parse_history_range(parts, total_len)
+            if err_msg:
+                await self.send_message_rest(user_openid, err_msg)
+                return
+
+            if start_idx > total_len:
+                reply = f"⚠️ 请求的起始序号 [{start_idx}] 超出历史会话总数（共 {total_len} 个）。当前有效范围为 1 ~ {total_len}。"
+                await self.send_message_rest(user_openid, reply)
+                return
+
+            # 校验成功后才刷新 90 秒窗口与计数
+            self.cached_history_list = all_convs
+            self.last_history_time = time.time()
+            self.history_resume_count = 0
+
+            actual_end = min(end_idx, total_len)
+            selected_convs = all_convs[start_idx - 1 : actual_end]
+            if not selected_convs:
+                reply = f"ℹ️ 未找到对应范围的历史会话记录（共 {total_len} 个）。当前有效范围为 1 ~ {total_len}。"
+                await self.send_message_rest(user_openid, reply)
+                return
+
+            lines = [f"📜 **AGY 历史会话列表**（共 {total_len} 个，展示第 {start_idx} ~ {actual_end} 个）：\n"]
+            for idx, item in enumerate(selected_convs, start_idx):
+                ts_sec = parse_timestamp(item.get("last_timestamp"))
+                time_str = time.strftime("%m-%d %H:%M", time.localtime(ts_sec)) if ts_sec > 0 else "未知时间"
+                ws_short = shorten_workspace(item["workspace"])
+                title = item["final_title"].replace("\n", " ").replace("\r", " ")
+                if len(title) > 32:
+                    title = title[:32] + "..."
+                if not title:
+                    title = "（新会话/无主题）"
+
+                lines.append(f"**[{idx}]** 💬 {title}\n📁 `{ws_short}` | 🕒 {time_str}\n")
+
+            lines.append(f"👉 **恢复会话**：90 秒内输入 `/resume <编号>` (如 `/resume {start_idx}`) 即可切换（最多跳转 3 次）。")
+            lines.append("💡 **翻页提示**：支持范围如 `/history 31-40`、页码如 `/history p4` 或指定数量如 `/history 10`。")
+            reply = "\n".join(lines)
+            await self.send_message_rest(user_openid, reply)
+            return
+
+        if cmd in ["/resume", "/切换", "/switch", "resume"]:
+            logger.info(f"[Recv] Resume session requested: {content}")
+            now = time.time()
+
+            # 1. 检查是否存在有效 history 缓存以及是否在 90 秒内
+            if not self.cached_history_list or self.last_history_time == 0:
+                reply = (
+                    "⚠️ **未找到有效的历史会话列表**\n\n"
+                    "• 请先发送 `/history` 查看历史会话列表；\n"
+                    "• 并在列表展示后的 **90 秒内** 使用 `/resume <编号>` 进行恢复。"
+                )
+                await self.send_message_rest(user_openid, reply)
+                return
+
+            elapsed = now - self.last_history_time
+            if elapsed > 90:
+                reply = (
+                    f"⚠️ **历史会话列表已过期**（已过 {int(elapsed)} 秒，超时限制为 90 秒）。\n\n"
+                    "👉 请重新发送 `/history` 获取最新会话列表后再进行恢复。"
+                )
+                await self.send_message_rest(user_openid, reply)
+                return
+
+            # 2. 检查 90 秒内跳转次数上限（最多 3 次）
+            if self.history_resume_count >= 3:
+                reply = (
+                    "⚠️ **本轮历史会话的恢复跳转次数已达上限**（最多连续跳转 3 次）。\n\n"
+                    "👉 如需继续切换会话，请重新发送 `/history` 刷新会话列表。"
+                )
+                await self.send_message_rest(user_openid, reply)
+                return
+
+            # 3. 参数检测
+            if len(parts) < 2:
+                remaining_time = max(1, int(90 - elapsed))
+                remaining_jumps = 3 - self.history_resume_count
+                reply = (
+                    "ℹ️ **请指定要恢复的会话序号**\n\n"
+                    f"• 示例：`/resume 1`\n"
+                    f"• 状态：本轮还可跳转 {remaining_jumps} 次，列表有效期剩余 {remaining_time} 秒。\n"
+                    "• 提示：可发送 `/history` 重新查看会话列表与编号。"
+                )
+                await self.send_message_rest(user_openid, reply)
+                return
+
+            if len(parts) > 2:
+                reply = (
+                    f"⚠️ **参数过多**：`/resume` 仅支持单个会话编号。\n\n"
+                    f"• 正确示例：`/resume {parts[1]}`\n"
+                    f"• 请勿在编号后输入多余参数。"
+                )
+                await self.send_message_rest(user_openid, reply)
+                return
+
+            target_arg = parts[1].strip()
+
+            # 检查是否误输入了范围（如 31-40 或 31~40）
+            if re.search(r"[-~.]", target_arg):
+                reply = (
+                    f"⚠️ 检测到范围格式「{target_arg}」，`/resume` 仅支持恢复单个会话编号（如 `/resume 1`）。\n\n"
+                    f"👉 若要查看第 {target_arg} 项的会话列表，请使用：`/history {target_arg}`"
+                )
+                await self.send_message_rest(user_openid, reply)
+                return
+
+            # 检查是否误输入了页码（如 p2, page 2）
+            if re.match(r"^(?:p|page|页)\d+$", target_arg, re.I):
+                reply = (
+                    f"⚠️ 检测到页码格式「{target_arg}」，`/resume` 仅支持具体会话编号（如 `/resume 1`）。\n\n"
+                    f"👉 若要查看该页会话列表，请使用：`/history {target_arg}`"
+                )
+                await self.send_message_rest(user_openid, reply)
+                return
+
+            all_convs = self.cached_history_list
+            clean_arg = target_arg.lstrip("#").strip("[]()")
+
+            if not clean_arg.isdigit():
+                reply = (
+                    f"⚠️ 无效的参数「{target_arg}」。`/resume` 的参数必须为纯数字会话编号。\n\n"
+                    f"• 正确示例：`/resume 1`\n"
+                    f"• 当前列表中共有 {len(all_convs)} 个会话，可发送 `/history` 重新查看。"
+                )
+                await self.send_message_rest(user_openid, reply)
+                return
+
+            idx = int(clean_arg)
+            if idx <= 0:
+                reply = f"⚠️ 会话编号必须从 1 开始（输入为 {idx}）。当前有效编号范围为 1 ~ {len(all_convs)}。"
+                await self.send_message_rest(user_openid, reply)
+                return
+
+            if idx > len(all_convs):
+                reply = f"⚠️ 请求的会话编号 [{idx}] 超出当前列表总数（共 {len(all_convs)} 个）。当前有效编号范围为 1 ~ {len(all_convs)}。可发送 `/history` 重新查看。"
+                await self.send_message_rest(user_openid, reply)
+                return
+
+            target_item = all_convs[idx - 1]
+
+            target_cid = target_item["cid"]
+            orig_ws_str = target_item.get("workspace", "")
+            old_ws = self.agy_workspace
+            target_cwd = Path(orig_ws_str) if (orig_ws_str and Path(orig_ws_str).exists()) else self.agy_workspace
+            ws_changed = (target_cwd.resolve() != old_ws.resolve())
+
+            logger.info(f"[Resume] Switching to conv_id={target_cid}, cwd={target_cwd} (ws_changed={ws_changed})")
+
+            # 1. 重拉 tmux 会话
+            await self.restart_agy(conversation_id=target_cid, cwd=target_cwd)
+
+            self.history_resume_count += 1
+            remaining_jumps = 3 - self.history_resume_count
+            remaining_time = max(1, int(90 - (time.time() - self.last_history_time)))
+            jump_note = (
+                f"\n• **跳转限额**: 本轮剩余 {remaining_jumps} 次（有效期剩 {remaining_time} 秒）"
+                if remaining_jumps > 0
+                else "\n• **跳转限额**: 本轮 3 次跳转已用完，下次切换请先发送 `/history`"
+            )
+
+            ws_short = shorten_workspace(str(target_cwd))
+            title_snippet = target_item.get("final_title", "")[:35]
+            if len(target_item.get("final_title", "")) > 35:
+                title_snippet += "..."
+
+            change_note = f"\n• **工作区切换**: 目录已同步切换至 `{target_cwd}`" if ws_changed else f"\n• **工作目录**: `{ws_short}`"
+
+            reply = (
+                f"🔄 **已成功恢复历史会话**\n\n"
+                f"• **会话主题**: {title_snippet}"
+                f"{change_note}"
+                f"{jump_note}\n\n"
+                f"👉 终端已在后台热重载就绪，直接发送消息即可在当前会话中继续工作！"
+            )
+            await self.send_message_rest(user_openid, reply)
+            return
+
+        if cmd in ["/rename", "/重命名", "/name", "rename"]:
+            logger.info(f"[Recv] Rename session requested: {content}")
+            curr_cid = self.get_current_conv_id()
+            if not curr_cid:
+                reply = "⚠️ 当前尚未绑定任何活动会话（可先发送一条消息开启对话后再重命名）。"
+                await self.send_message_rest(user_openid, reply)
+                return
+
+            if len(parts) < 2:
+                reply = (
+                    "ℹ️ **请提供新的会话主题**\n\n"
+                    "• 示例：`/rename 修复QQ机器人功能`"
+                )
+                await self.send_message_rest(user_openid, reply)
+                return
+
+            new_title = " ".join(parts[1:]).strip()
+            is_valid, err_msg = validate_rename_title(new_title)
+            if not is_valid:
+                await self.send_message_rest(user_openid, err_msg)
+                return
+
+            success, old_title = rename_conversation(curr_cid, new_title)
+            if success:
+                if self.cached_history_list:
+                    for c in self.cached_history_list:
+                        if c["cid"] == curr_cid:
+                            c["final_title"] = new_title
+                            break
+                reply = (
+                    f"🏷️ **会话主题修改成功**\n\n"
+                    f"• 会话主题已从「{old_title}」改为「{new_title}」\n\n"
+                    f"👉 修改已即时生效，发送 `/history` 即可在列表中查看更新后的名称。"
+                )
+            else:
+                reply = "❌ 修改会话主题失败，请检查会话持久化存储状态。"
             await self.send_message_rest(user_openid, reply)
             return
 
@@ -542,7 +1413,7 @@ async def get_local_git_status(workspace: Path) -> str:
 
         if content.strip().lower() in ["/git", "/git status", "git status", "/git diff"]:
             logger.info("[Recv] Local git status requested")
-            reply = await get_local_git_status(Path.cwd())
+            reply = await get_local_git_status(self.agy_workspace)
             await self.send_message_rest(user_openid, reply)
             return
 
@@ -550,8 +1421,12 @@ async def get_local_git_status(workspace: Path) -> str:
             reply = (
                 "🤖 **AGY-QQ-Bridge 控制中心**\n\n"
                 "• `/new` 或 `/清空`：重置后台 tmux 会话，开启全新无上下文会话\n"
+                "• `/history` 或 `/历史`：查看历史会话列表（如 `/history 10`、`/history 31-40`）\n"
+                "• `/resume <编号>`：快速切换并恢复至指定历史会话继续工作\n"
+                "• `/rename <新主题>`：重命名当前已绑定会话的主题名称\n"
                 "• `/stop` 或 `/停止`：向后台发送 Ctrl+C 中断信号终止当前任务\n"
                 "• `/status` 或 `/状态`：查看当前工作区与会话绑定状态\n"
+                "• `git status`：秒级本地诊断当前工作区 Git 变动状态\n"
                 "• 直接发送文本：自动输入给后台 Google Antigravity CLI\n"
                 "• 发送图片/文件：原生直链由 AGY 视觉与多模态解析"
             )
@@ -559,12 +1434,17 @@ async def get_local_git_status(workspace: Path) -> str:
             return
 
         if content.strip().lower() in ["/status", "/状态", "status"]:
-            conv_name = self.current_log_path.parent.name if self.current_log_path else "暂未绑定（等待首条消息）"
+            curr_cid = self.get_current_conv_id()
+            if curr_cid:
+                title = get_conversation_title(curr_cid)
+                conv_desc = f"{title}"
+            else:
+                conv_desc = "暂未绑定（等待首条消息）"
             reply = (
                 "📊 **AGY-QQ-Bridge 运行状态**\n\n"
                 f"• **tmux 会话**: `{self.tmux_session}`\n"
-                f"• **当前会话**: `{conv_name}`\n"
-                f"• **启动命令**: `{self.agy_start_cmd}`\n"
+                f"• **当前会话**: {conv_desc}\n"
+                f"• **工作区**: `{self.agy_workspace}`\n"
                 f"• **管理员**: `{self.master_openid[:8]}...`"
             )
             await self.send_message_rest(user_openid, reply)
@@ -639,26 +1519,244 @@ async def get_local_git_status(workspace: Path) -> str:
         # 判断发送人是否是主人授权执行命令
         is_master = (member_openid == self.master_openid)
 
-        if is_master and clean_content.lower() in ["/new", "/reset", "/清空", "/新对话", "new", "reset"]:
-            logger.info("[Group Recv] Reset command received")
-            proc_kill = await asyncio.create_subprocess_shell(f"tmux kill-session -t {self.tmux_session} 2>/dev/null || true")
-            await proc_kill.communicate()
-            await asyncio.sleep(0.5)
-            proc_new = await asyncio.create_subprocess_exec("tmux", "new-session", "-d", "-s", self.tmux_session)
-            await proc_new.communicate()
-            await asyncio.sleep(2.0)
-            proc_start = await asyncio.create_subprocess_exec(
-                "tmux", "send-keys", "-t", f"{self.tmux_session}:", self.agy_start_cmd, "Enter"
-            )
-            await proc_start.communicate()
-            await asyncio.sleep(4.0)
-            proc_enter = await asyncio.create_subprocess_exec(
-                "tmux", "send-keys", "-t", f"{self.tmux_session}:", "Enter", ""
-            )
-            await proc_enter.communicate()
+        g_parts = clean_content.split()
+        g_cmd = g_parts[0].lower() if g_parts else ""
 
+        if is_master and g_cmd in ["/new", "/reset", "/清空", "/新对话", "new", "reset"]:
+            logger.info("[Group Recv] Reset command received")
+            self.cached_history_list = []
+            self.last_history_time = 0.0
+            self.history_resume_count = 0
             self.group_chat_buffer.clear()
+            self.current_log_path = None
+            self.last_log_size = 0
+            self.last_sent_timestamp = ""
+            await self.restart_agy(conversation_id=None)
             reply = "✅ 已强杀并重建 tmux 会话，重新拉起全新 AGY。上下文与群聊缓存已完全重置。"
+            await self.send_group_message_rest(group_openid, reply, reply_to=msg_id)
+            return
+
+        if is_master and g_cmd in ["/history", "/历史", "/sessions", "history"]:
+            logger.info(f"[Group Recv] History list requested: {clean_content}")
+            all_convs = get_history_conversations()
+            total_len = len(all_convs)
+
+            if not all_convs:
+                reply = "ℹ️ 未找到任何历史会话记录。"
+                await self.send_group_message_rest(group_openid, reply, reply_to=msg_id)
+                return
+
+            start_idx, end_idx, err_msg = parse_history_range(g_parts, total_len)
+            if err_msg:
+                await self.send_group_message_rest(group_openid, err_msg, reply_to=msg_id)
+                return
+
+            if start_idx > total_len:
+                reply = f"⚠️ 请求的起始序号 [{start_idx}] 超出历史会话总数（共 {total_len} 个）。当前有效范围为 1 ~ {total_len}。"
+                await self.send_group_message_rest(group_openid, reply, reply_to=msg_id)
+                return
+
+            # 校验成功后才刷新 90 秒窗口与计数
+            self.cached_history_list = all_convs
+            self.last_history_time = time.time()
+            self.history_resume_count = 0
+
+            actual_end = min(end_idx, total_len)
+            selected_convs = all_convs[start_idx - 1 : actual_end]
+            if not selected_convs:
+                reply = f"ℹ️ 未找到对应范围的历史会话记录（共 {total_len} 个）。当前有效范围为 1 ~ {total_len}。"
+                await self.send_group_message_rest(group_openid, reply, reply_to=msg_id)
+                return
+
+            lines = [f"📜 **AGY 历史会话列表**（共 {total_len} 个，展示第 {start_idx} ~ {actual_end} 个）：\n"]
+            for idx, item in enumerate(selected_convs, start_idx):
+                ts_sec = parse_timestamp(item.get("last_timestamp"))
+                time_str = time.strftime("%m-%d %H:%M", time.localtime(ts_sec)) if ts_sec > 0 else "未知时间"
+                ws_short = shorten_workspace(item["workspace"])
+                title = item["final_title"].replace("\n", " ").replace("\r", " ")
+                if len(title) > 32:
+                    title = title[:32] + "..."
+                if not title:
+                    title = "（新会话/无主题）"
+
+                lines.append(f"**[{idx}]** 💬 {title}\n📁 `{ws_short}` | 🕒 {time_str}\n")
+
+            lines.append(f"👉 **恢复会话**：90 秒内输入 `@机器人 /resume <编号>` (如 `/resume {start_idx}`) 即可切换（最多跳转 3 次）。")
+            lines.append("💡 **翻页提示**：支持范围如 `/history 31-40`、页码如 `/history p4` 或指定数量如 `/history 10`。")
+            reply = "\n".join(lines)
+            await self.send_group_message_rest(group_openid, reply, reply_to=msg_id)
+            return
+
+        if is_master and g_cmd in ["/resume", "/切换", "/switch", "resume"]:
+            logger.info(f"[Group Recv] Resume session requested: {clean_content}")
+            now = time.time()
+
+            # 1. 检查是否存在有效 history 缓存以及是否在 90 秒内
+            if not self.cached_history_list or self.last_history_time == 0:
+                reply = (
+                    "⚠️ **未找到有效的历史会话列表**\n\n"
+                    "• 请先发送 `@机器人 /history` 查看历史会话列表；\n"
+                    "• 并在列表展示后的 **90 秒内** 使用 `@机器人 /resume <编号>` 进行恢复。"
+                )
+                await self.send_group_message_rest(group_openid, reply, reply_to=msg_id)
+                return
+
+            elapsed = now - self.last_history_time
+            if elapsed > 90:
+                reply = (
+                    f"⚠️ **历史会话列表已过期**（已过 {int(elapsed)} 秒，超时限制为 90 秒）。\n\n"
+                    "👉 请重新发送 `@机器人 /history` 获取最新会话列表后再进行恢复。"
+                )
+                await self.send_group_message_rest(group_openid, reply, reply_to=msg_id)
+                return
+
+            # 2. 检查 90 秒内跳转次数上限（最多 3 次）
+            if self.history_resume_count >= 3:
+                reply = (
+                    "⚠️ **本轮历史会话的恢复跳转次数已达上限**（最多连续跳转 3 次）。\n\n"
+                    "👉 如需继续切换会话，请重新发送 `@机器人 /history` 刷新会话列表。"
+                )
+                await self.send_group_message_rest(group_openid, reply, reply_to=msg_id)
+                return
+
+            # 3. 参数检测
+            if len(g_parts) < 2:
+                remaining_time = max(1, int(90 - elapsed))
+                remaining_jumps = 3 - self.history_resume_count
+                reply = (
+                    "ℹ️ **请指定要恢复的会话序号**\n\n"
+                    f"• 示例：`@机器人 /resume 1`\n"
+                    f"• 状态：本轮还可跳转 {remaining_jumps} 次，列表有效期剩余 {remaining_time} 秒。\n"
+                    "• 提示：可发送 `@机器人 /history` 查看最近历史会话列表。"
+                )
+                await self.send_group_message_rest(group_openid, reply, reply_to=msg_id)
+                return
+
+            if len(g_parts) > 2:
+                reply = (
+                    f"⚠️ **参数过多**：`/resume` 仅支持单个会话编号。\n\n"
+                    f"• 正确示例：`@机器人 /resume {g_parts[1]}`\n"
+                    f"• 请勿在编号后输入多余参数。"
+                )
+                await self.send_group_message_rest(group_openid, reply, reply_to=msg_id)
+                return
+
+            target_arg = g_parts[1].strip()
+
+            # 检查是否误输入了范围（如 31-40 或 31~40）
+            if re.search(r"[-~.]", target_arg):
+                reply = (
+                    f"⚠️ 检测到范围格式「{target_arg}」，`/resume` 仅支持恢复单个会话编号（如 `@机器人 /resume 1`）。\n\n"
+                    f"👉 若要查看第 {target_arg} 项的会话列表，请使用：`@机器人 /history {target_arg}`"
+                )
+                await self.send_group_message_rest(group_openid, reply, reply_to=msg_id)
+                return
+
+            # 检查是否误输入了页码（如 p2, page 2）
+            if re.match(r"^(?:p|page|页)\d+$", target_arg, re.I):
+                reply = (
+                    f"⚠️ 检测到页码格式「{target_arg}」，`/resume` 仅支持具体会话编号（如 `@机器人 /resume 1`）。\n\n"
+                    f"👉 若要查看该页会话列表，请使用：`@机器人 /history {target_arg}`"
+                )
+                await self.send_group_message_rest(group_openid, reply, reply_to=msg_id)
+                return
+
+            all_convs = self.cached_history_list
+            clean_arg = target_arg.lstrip("#").strip("[]()")
+
+            if not clean_arg.isdigit():
+                reply = (
+                    f"⚠️ 无效的参数「{target_arg}」。`/resume` 的参数必须为纯数字会话编号。\n\n"
+                    f"• 正确示例：`@机器人 /resume 1`\n"
+                    f"• 当前列表中共有 {len(all_convs)} 个会话，可发送 `@机器人 /history` 重新查看。"
+                )
+                await self.send_group_message_rest(group_openid, reply, reply_to=msg_id)
+                return
+
+            idx = int(clean_arg)
+            if idx <= 0:
+                reply = f"⚠️ 会话编号必须从 1 开始（输入为 {idx}）。当前有效编号范围为 1 ~ {len(all_convs)}。"
+                await self.send_group_message_rest(group_openid, reply, reply_to=msg_id)
+                return
+
+            if idx > len(all_convs):
+                reply = f"⚠️ 请求的会话编号 [{idx}] 超出当前列表总数（共 {len(all_convs)} 个）。当前有效编号范围为 1 ~ {len(all_convs)}。可发送 `@机器人 /history` 重新查看。"
+                await self.send_group_message_rest(group_openid, reply, reply_to=msg_id)
+                return
+
+            target_item = all_convs[idx - 1]
+
+            target_cid = target_item["cid"]
+            orig_ws_str = target_item.get("workspace", "")
+            old_ws = self.agy_workspace
+            target_cwd = Path(orig_ws_str) if (orig_ws_str and Path(orig_ws_str).exists()) else self.agy_workspace
+            ws_changed = (target_cwd.resolve() != old_ws.resolve())
+
+            await self.restart_agy(conversation_id=target_cid, cwd=target_cwd)
+            self.group_chat_buffer.clear()
+
+            self.history_resume_count += 1
+            remaining_jumps = 3 - self.history_resume_count
+            remaining_time = max(1, int(90 - (time.time() - self.last_history_time)))
+            jump_note = (
+                f"\n• **跳转限额**: 本轮剩余 {remaining_jumps} 次（有效期剩 {remaining_time} 秒）"
+                if remaining_jumps > 0
+                else "\n• **跳转限额**: 本轮 3 次跳转已用完，下次切换请先发送 `@机器人 /history`"
+            )
+
+            ws_short = shorten_workspace(str(target_cwd))
+            title_snippet = target_item.get("final_title", "")[:35]
+            if len(target_item.get("final_title", "")) > 35:
+                title_snippet += "..."
+
+            change_note = f"\n• **工作区切换**: 目录已同步切换至 `{target_cwd}`" if ws_changed else f"\n• **工作目录**: `{ws_short}`"
+
+            reply = (
+                f"🔄 **已成功恢复历史会话**\n\n"
+                f"• **会话主题**: {title_snippet}"
+                f"{change_note}"
+                f"{jump_note}\n\n"
+                f"👉 终端已在后台热重载就绪，直接 @机器人 发送消息即可在当前会话中继续工作！"
+            )
+            await self.send_group_message_rest(group_openid, reply, reply_to=msg_id)
+            return
+
+        if is_master and g_cmd in ["/rename", "/重命名", "/name", "rename"]:
+            logger.info(f"[Group Recv] Rename session requested: {clean_content}")
+            curr_cid = self.get_current_conv_id()
+            if not curr_cid:
+                reply = "⚠️ 当前尚未绑定任何活动会话（可先发送一条消息开启对话后再重命名）。"
+                await self.send_group_message_rest(group_openid, reply, reply_to=msg_id)
+                return
+
+            if len(g_parts) < 2:
+                reply = (
+                    "ℹ️ **请提供新的会话主题**\n\n"
+                    "• 示例：`@机器人 /rename 修复QQ机器人功能`"
+                )
+                await self.send_group_message_rest(group_openid, reply, reply_to=msg_id)
+                return
+
+            new_title = " ".join(g_parts[1:]).strip()
+            is_valid, err_msg = validate_rename_title(new_title)
+            if not is_valid:
+                await self.send_group_message_rest(group_openid, err_msg, reply_to=msg_id)
+                return
+
+            success, old_title = rename_conversation(curr_cid, new_title)
+            if success:
+                if self.cached_history_list:
+                    for c in self.cached_history_list:
+                        if c["cid"] == curr_cid:
+                            c["final_title"] = new_title
+                            break
+                reply = (
+                    f"🏷️ **会话主题修改成功**\n\n"
+                    f"• 会话主题已从「{old_title}」改为「{new_title}」\n\n"
+                    f"👉 修改已即时生效，发送 `/history` 即可在列表中查看更新后的名称。"
+                )
+            else:
+                reply = "❌ 修改会话主题失败，请检查会话持久化存储状态。"
             await self.send_group_message_rest(group_openid, reply, reply_to=msg_id)
             return
 
@@ -684,7 +1782,7 @@ async def get_local_git_status(workspace: Path) -> str:
 
         if clean_content.lower() in ["/git", "/git status", "git status", "/git diff"]:
             logger.info("[Group Recv] Local git status requested")
-            reply = await get_local_git_status(Path.cwd())
+            reply = await get_local_git_status(self.agy_workspace)
             await self.send_group_message_rest(group_openid, reply, reply_to=msg_id)
             return
 
@@ -692,19 +1790,29 @@ async def get_local_git_status(workspace: Path) -> str:
             reply = (
                 "🤖 **AGY-QQ-Bridge 群聊指令说明**\n\n"
                 "• `@机器人 /new`：(管理员) 重置会话与群聊讨论缓存\n"
+                "• `@机器人 /history`：(管理员) 查看历史会话列表（如 `/history 10`、`/history 31-40`）\n"
+                "• `@机器人 /resume <编号>`：(管理员) 快速切换并恢复至指定会话\n"
+                "• `@机器人 /rename <新主题>`：(管理员) 重命名当前活动会话主题\n"
                 "• `@机器人 /stop`：(管理员) 发送中断信号停止当前任务\n"
                 "• `@机器人 /status`：查看当前运行状态与工作区\n"
+                "• `git status`：秒级本地诊断当前工作区 Git 变动状态\n"
                 "• `@机器人 [问题]`：将群聊最近上下文与提问汇总送交 AGY CLI"
             )
             await self.send_group_message_rest(group_openid, reply, reply_to=msg_id)
             return
 
         if clean_content.lower() in ["/status", "/状态", "status"]:
-            conv_name = self.current_log_path.parent.name if self.current_log_path else "暂未绑定"
+            curr_cid = self.get_current_conv_id()
+            if curr_cid:
+                title = get_conversation_title(curr_cid)
+                conv_desc = f"{title}"
+            else:
+                conv_desc = "暂未绑定"
             reply = (
                 "📊 **AGY-QQ-Bridge 运行状态**\n\n"
                 f"• **tmux 会话**: `{self.tmux_session}`\n"
-                f"• **当前会话**: `{conv_name}`\n"
+                f"• **当前会话**: {conv_desc}\n"
+                f"• **工作区**: `{self.agy_workspace}`\n"
                 f"• **群聊缓冲数**: {len(self.group_chat_buffer)} 条"
             )
             await self.send_group_message_rest(group_openid, reply, reply_to=msg_id)
@@ -775,10 +1883,10 @@ async def get_local_git_status(workspace: Path) -> str:
                             logger.info("Session resumed")
                         elif t == "C2C_MESSAGE_CREATE":
                             task = asyncio.create_task(self.handle_c2c_message(d))
-                            task.add_done_callback(lambda t: t.exception() if not t.cancelled() else None)
+                            task.add_done_callback(_log_task_exception)
                         elif t in {"GROUP_AT_MESSAGE_CREATE", "GROUP_MESSAGE_CREATE"}:
                             task = asyncio.create_task(self.handle_group_message(d, t))
-                            task.add_done_callback(lambda t: t.exception() if not t.cancelled() else None)
+                            task.add_done_callback(_log_task_exception)
                         continue
 
                 elif msg.type == 9:

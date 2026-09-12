@@ -80,6 +80,11 @@ DEFAULT_CUSTOM_MENU = {
                     },
                     {
                         "type": "send_message",
+                        "name": "历史会话",
+                        "send_message": "/history"
+                    },
+                    {
+                        "type": "send_message",
                         "name": "工作区变动",
                         "send_message": "git status"
                     },
@@ -108,22 +113,37 @@ DEFAULT_C2C_PANEL = {
             {
                 "type": "command",
                 "name": "/stop",
-                "desc": "发送中断信号终止当前任务"
+                "desc": "发送中断信号终止任务"
+            },
+            {
+                "type": "command",
+                "name": "/history",
+                "desc": "查看最近历史会话列表"
+            },
+            {
+                "type": "command",
+                "name": "/resume",
+                "desc": "恢复并继续历史会话"
+            },
+            {
+                "type": "command",
+                "name": "/rename",
+                "desc": "重命名当前会话主题"
             },
             {
                 "type": "command",
                 "name": "/help",
-                "desc": "查看常用快捷指令与帮助"
+                "desc": "查看快捷指令与帮助"
             },
             {
                 "type": "command",
                 "name": "/status",
-                "desc": "查看桥接器与终端运行状态"
+                "desc": "查看桥接器运行状态"
             },
             {
                 "type": "command",
                 "name": "git status",
-                "desc": "查看当前 Git 代码工作区状态"
+                "desc": "查看工作区代码变动"
             }
         ]
     }
@@ -138,22 +158,37 @@ DEFAULT_GROUP_PANEL = {
             {
                 "type": "command",
                 "name": "/new",
-                "desc": "清空上下文并新建会话 (管理员)"
+                "desc": "新建会话(管理员)"
             },
             {
                 "type": "command",
                 "name": "/stop",
-                "desc": "发送中断信号终止任务 (管理员)"
+                "desc": "终止任务(管理员)"
+            },
+            {
+                "type": "command",
+                "name": "/history",
+                "desc": "历史会话(管理员)"
+            },
+            {
+                "type": "command",
+                "name": "/resume",
+                "desc": "恢复会话(管理员)"
+            },
+            {
+                "type": "command",
+                "name": "/rename",
+                "desc": "重命名主题(管理员)"
             },
             {
                 "type": "command",
                 "name": "/help",
-                "desc": "查看机器人指令帮助说明"
+                "desc": "查看机器人指令帮助"
             },
             {
                 "type": "command",
                 "name": "/status",
-                "desc": "查看当前机器人运行状态"
+                "desc": "查看机器人运行状态"
             }
         ]
     }
