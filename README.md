@@ -182,22 +182,25 @@ TMUX_SESSION=0                                                 # tmux 会话名�
 
 ## 📝 更新日志
 
+### v2.3.0 (2026-09-12)
+*   **扁平化与极简工程重构 (Flat Layout)**：核心代码包直接提至项目根目录 `agy_qq_bridge/`，彻底消除 `src/` 冗余嵌套，原生运行与模块导入更加直接清爽。
+*   **迁移至现代标准 `hatchling` 构建后端**：全面遵循 PEP 621 / PEP 660 规范，从根源上彻底绝杀任何 `*.egg-info` 临时构建目录污染，源码目录保持 100% 纤尘不染。
+*   **依赖声明合并与单配置中心**：淘汰冗余的 `requirements.txt`，由 `pyproject.toml` 统一管理依赖与 Windows 平台自适应标记（`pywinpty`）。
+*   **外围套件收敛与文档统一**：内置 TCP 28712 端口单实例防双开锁，将多源监控工具内聚为 `monitor.py`，并将 Windows 原生指南与演进实证库规整至 `docs/`，形成标准的 3 目录极简结构。
+
 ### v2.2.0 (2026-09-12)
-*   **工程结构极致精简**：
-    *   统一采用 PEP 621 标准 `pyproject.toml` 作为唯一元数据与依赖配置，安全合并淘汰 `requirements.txt`；
-    *   将 `evidence/` 实证库规整至 `docs/evidence/`，将 Windows 套件整合为 `docs/WINDOWS.md` 并将防双开锁原生融入内核；
-    *   收敛所有散装脚本，整洁形成标准的 3 目录（`src/`、`docs/`、`tests/`）规范架构。
-*   **核心架构分层解耦重构**：模块化拆分为 `config`、`terminal`、`session_manager`、`qq_client`、`log_listener`、`bridge`。
+*   **核心架构分层解耦重构**：将原先单体脚本重构为模块化架构（`config` 配置中心、`terminal` 终端抽象层、`session_manager` 会话生命周期、`qq_client` 通信客户端、`log_listener` 日志监听、`bridge` 调度中心），大幅消除冗余代码。
 *   **跨平台虚拟终端抽象**：Linux (`TmuxTerminalManager`) 与 Windows (`WinptyTerminalManager`) 统一接口，自动应答 `\x1b[c` 握手并具备进程自愈能力。
 *   **会话历史与切换增强 (`/history`, `/resume`)**：
     *   原生 100% 对齐 AGY 原生规则，过滤空会话；
-    *   支持范围模式（如 `/history 31-40`）、分页模式（如 `/history p4`）与单次 15 条安全上限；
+    *   灵活支持范围模式（如 `/history 31-40`）、分页模式（如 `/history p4`）与单次 15 条安全上限；
     *   限制 `/resume` 在 `/history` 查询后 90 秒内使用且单轮最多跳转 3 次，防止误操作；
     *   移动端视觉排版优化（第一行会话名称、第二行工作区与时间，隐藏内部 UUID）。
 *   **会话重命名三重持久化 (`/rename`)**：
     *   实现 `annotations/<cid>.pbtxt` + `conversation_metadata.json` + SQLite `conversation_summaries.db` 同步更新，杜绝重启被 AGY 覆盖；
     *   全指令参数防御机制，严防误将 resume/history 指令或参数当做主题写入。
 *   **零 Token 诊断与智能打断**：`git status` 本地秒级直接执行；`/stop` 空闲状态发 `Escape` 防误退、忙碌状态单次 `Ctrl+C` 安全中断。
+*   **QQ 开放平台自定义菜单与指令面板生态集成**：启动时通过异步协程自动向 QQ 网关注册同步单聊菜单与指令面板。
 
 ---
 
