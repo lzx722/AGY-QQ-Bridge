@@ -1,5 +1,7 @@
 # AGY-QQ-Bridge: 极简 C2C 异步日志增量 QQ 桥接器
 
+[![Repo](https://img.shields.io/badge/GitHub-lzx722%2FAGY--QQ--Bridge-blue?logo=github)](https://github.com/lzx722/AGY-QQ-Bridge)
+[![Original Author](https://img.shields.io/badge/致敬原作者-zz327455573-orange)](https://github.com/zz327455573/AGY-QQ-Bridge)
 [![Agent Keep](https://img.shields.io/badge/🏠_Agent_Keep-生态项目-blue)](https://github.com/zz327455573/agent-keep)
 
 AGY-QQ-Bridge 是一个用于将本地常驻运行的 Google Antigravity (AGY) 实例直连到 QQ 个人私聊通道的轻量级桥接系统。
@@ -51,8 +53,10 @@ flowchart TD
 需要 Python 3.10+ 环境。Linux 环境推荐安装 `tmux`；Windows 原生环境无需额外系统组件，已原生支持 ConPTY。
 
 ```bash
-# 从源码或 pip 安装
-pip install git+https://github.com/zz327455573/AGY-QQ-Bridge.git
+# 从源码克隆并安装
+git clone https://github.com/lzx722/AGY-QQ-Bridge.git
+cd AGY-QQ-Bridge
+pip install -e .
 
 # 查看已安装的可执行命令
 which agy-qq-bridge
@@ -162,3 +166,11 @@ pm2 logs agy-qq-bridge
 ### v2.0.0 (2026-06-29)
 *   **多模态支持**：实现了附件功能的零阻拦直传。机器人接收到图片、语音（SILK格式）、视频以及任意文件后，不再进行本地缓存，而是将 QQ 临时下载 URL 自动原样透传给大模型进行原生多模态识别与解析；
 *   **代码优化**：升级 API 请求 User-Agent 头至 `AGY-QQ-Bridge/2.0`。
+
+---
+
+## 🙏 致谢 (Credits & Acknowledgments)
+
+本项目基于 [zz327455573/AGY-QQ-Bridge](https://github.com/zz327455573/AGY-QQ-Bridge) 与 [Agent Keep](https://github.com/zz327455573/agent-keep) 生态项目进行深度重构与架构升级。
+
+由衷感谢原作者 **[zz327455573](https://github.com/zz327455573)** 及开源社区贡献者的最初探索与卓越灵感，奠定了通过增量日志监听与虚拟终端解耦操控 Antigravity CLI 的开创性思路！

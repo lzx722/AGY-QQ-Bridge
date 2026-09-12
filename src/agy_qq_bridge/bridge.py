@@ -38,7 +38,7 @@ from .log_listener import LogListener
 
 logger = setup_logger("agy_qq_bridge")
 
-VERSION = "2.1.0"
+VERSION = "2.2.0"
 
 
 class BridgeApp:
